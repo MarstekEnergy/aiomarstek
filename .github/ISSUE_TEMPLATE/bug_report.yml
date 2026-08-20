@@ -1,0 +1,42 @@
+name: Bug report
+description: Report a problem with aiomarstek
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a bug. Please fill out as much of
+        the form below as you can.
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Which version of aiomarstek are you using?
+      placeholder: e.g. 0.1.1
+    validations:
+      required: true
+  - type: input
+    id: python
+    attributes:
+      label: Python version
+      description: Which Python version are you running?
+      placeholder: e.g. 3.13
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: What happened, and what did you expect to happen?
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction
+      description: Minimal code or steps to reproduce the issue.
+      render: python
+  - type: textarea
+    id: traceback
+    attributes:
+      label: Traceback
+      description: Paste any full traceback or error output.
+      render: text
