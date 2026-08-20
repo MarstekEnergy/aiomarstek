@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "aiomarstek"
-version = "0.1.1"
+version = "0.1.2"
 description = "Async client library for local Marstek devices"
 readme = "README.md"
 requires-python = ">=3.11"
