@@ -6,7 +6,7 @@ from typing import Any
 
 import pytest
 
-from aiomarstek import MarstekUDPClient
+from aiomarstek import MarstekDeviceInfo, MarstekUDPClient
 
 
 def _device_result(**overrides: Any) -> dict[str, Any]:
@@ -42,10 +42,16 @@ async def test_discover_devices_deduplicates(
     devices = await client.discover_devices(use_cache=False)
     assert len(devices) == 1
     device = devices[0]
-    assert device["ip"] == "192.168.1.10"
-    assert device["mac"] == "AA:BB:CC:DD:EE:FF"
-    assert device["firmware"] == "3"
-    assert device["device_type"] == "VENUS E"
+    assert device == MarstekDeviceInfo(
+        id=1,
+        device_type="VENUS E",
+        version=3,
+        wifi_name="home",
+        ip="192.168.1.10",
+        wifi_mac="AA:BB:CC:DD:EE:FF",
+        ble_mac="",
+        mac="AA:BB:CC:DD:EE:FF",
+    )
 
 
 async def test_discover_devices_skips_empty_result(
@@ -61,7 +67,7 @@ async def test_discover_devices_skips_empty_result(
 
     devices = await client.discover_devices(use_cache=False)
     assert len(devices) == 1
-    assert devices[0]["ip"] == "192.168.1.11"
+    assert devices[0].ip == "192.168.1.11"
 
 
 async def test_discover_devices_uses_cache(
@@ -95,7 +101,7 @@ async def test_polling_pause_resume() -> None:
 
 
 async def test_get_device_info(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Device info returns the result payload from the discovery response."""
+    """Device info returns a normalized device model."""
     client = MarstekUDPClient()
     expected = {"ip": "192.168.1.5", "device": "VENUS E"}
 
@@ -104,7 +110,16 @@ async def test_get_device_info(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr(client, "send_request", fake_send_request)
 
-    assert await client.get_device_info("192.168.1.5") == expected
+    assert await client.get_device_info("192.168.1.5") == MarstekDeviceInfo(
+        id=None,
+        device_type="VENUS E",
+        version=0,
+        wifi_name="",
+        ip="192.168.1.5",
+        wifi_mac="",
+        ble_mac="",
+        mac="",
+    )
 
 
 async def test_get_device_info_requires_result(

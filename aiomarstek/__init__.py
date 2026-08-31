@@ -21,6 +21,7 @@ from .const import (
     DEFAULT_UDP_PORT,
     DISCOVERY_TIMEOUT,
 )
+from .models import MarstekDeviceInfo, MarstekDeviceVersion
 from .udp_client import MarstekUDPClient
 
 __all__ = [
@@ -31,6 +32,8 @@ __all__ = [
     "CMD_PV_GET_STATUS",
     "DEFAULT_UDP_PORT",
     "DISCOVERY_TIMEOUT",
+    "MarstekDeviceInfo",
+    "MarstekDeviceVersion",
     "MarstekUDPClient",
     "build_command",
     "discover",

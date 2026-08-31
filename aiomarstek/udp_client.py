@@ -12,6 +12,7 @@ from typing import Any
 
 from .command_builder import discover, get_es_mode, get_pv_status
 from .const import DEFAULT_UDP_PORT, DISCOVERY_TIMEOUT
+from .models import MarstekDeviceInfo
 
 _LOGGER = logging.getLogger(__name__)
 _SOCKET_FACTORY = socket.socket
@@ -31,7 +32,7 @@ class MarstekUDPClient:
         self._pending_requests: dict[int, asyncio.Future] = {}
         self._response_cache: dict[int, dict[str, Any]] = {}
         self._listen_task: asyncio.Task | None = None
-        self._discovery_cache: list[dict[str, Any]] | None = None
+        self._discovery_cache: list[MarstekDeviceInfo] | None = None
         self._cache_timestamp: float = 0
         self._cache_duration: float = 30.0
         self._local_send_ip: str = "0.0.0.0"
@@ -43,7 +44,7 @@ class MarstekUDPClient:
         """Set broadcast addresses used for discovery."""
         self._broadcast_addresses = list(addresses)
 
-    def get_discovery_cache(self) -> list[dict[str, Any]] | None:
+    def get_discovery_cache(self) -> list[MarstekDeviceInfo] | None:
         """Return a copy of the discovery cache."""
         if self._discovery_cache is None:
             return None
@@ -95,6 +96,7 @@ class MarstekUDPClient:
         """Send UDP message to the specified target."""
         if not self._socket:
             await self.async_setup()
+        assert self._socket is not None
 
         try:
             data = message.encode("utf-8")
@@ -272,13 +274,14 @@ class MarstekUDPClient:
         self,
         use_cache: bool = True,
         broadcast_addresses: Iterable[str] | None = None,
-    ) -> list[dict[str, Any]]:
+    ) -> list[MarstekDeviceInfo]:
         """Discover Marstek devices on network and deduplicate results."""
         if use_cache and self._is_cache_valid():
             _LOGGER.debug("Using cached discovery results")
+            assert self._discovery_cache is not None
             return self._discovery_cache.copy()
 
-        devices: list[dict[str, Any]] = []
+        devices: list[MarstekDeviceInfo] = []
         seen_devices: set[str] = set()
 
         try:
@@ -288,22 +291,23 @@ class MarstekUDPClient:
             )
 
             for response in responses:
-                if response.get("result"):
-                    device_info = response["result"]
+                result = response.get("result")
+                if isinstance(result, dict):
+                    device_info = MarstekDeviceInfo.from_response(result)
                     device_id = (
-                        device_info.get("ip", "")
-                        or device_info.get("ble_mac")
-                        or device_info.get("wifi_mac")
-                        or f"device_{int(asyncio.get_running_loop().time())}_{hash(str(device_info)) % 10000}"
+                        device_info.ip
+                        or device_info.ble_mac
+                        or device_info.wifi_mac
+                        or f"device_{int(asyncio.get_running_loop().time())}_{hash(device_info) % 10000}"
                     )
 
                     if device_id in seen_devices:
                         _LOGGER.debug(
                             "Skip duplicate device: %s (IP: %s, BLE_MAC: %s, WiFi_MAC: %s)",
                             device_id,
-                            device_info.get("ip"),
-                            device_info.get("ble_mac"),
-                            device_info.get("wifi_mac"),
+                            device_info.ip,
+                            device_info.ble_mac,
+                            device_info.wifi_mac,
                         )
                         continue
 
@@ -311,33 +315,19 @@ class MarstekUDPClient:
                     _LOGGER.debug(
                         "Add device: %s (IP: %s, BLE_MAC: %s, WiFi_MAC: %s)",
                         device_id,
-                        device_info.get("ip"),
-                        device_info.get("ble_mac"),
-                        device_info.get("wifi_mac"),
+                        device_info.ip,
+                        device_info.ble_mac,
+                        device_info.wifi_mac,
                     )
 
-                    device = {
-                        "id": device_info.get("id", 0),
-                        "device_type": device_info.get("device", "Unknown"),
-                        "version": device_info.get("ver", 0),
-                        "wifi_name": device_info.get("wifi_name", ""),
-                        "ip": device_info.get("ip", ""),
-                        "wifi_mac": device_info.get("wifi_mac", ""),
-                        "ble_mac": device_info.get("ble_mac", ""),
-                        "mac": device_info.get("wifi_mac")
-                        or device_info.get("ble_mac", ""),
-                        "model": device_info.get("device", "Unknown"),
-                        "firmware": str(device_info.get("ver", 0)),
-                    }
-
-                    devices.append(device)
+                    devices.append(device_info)
                     _LOGGER.info(
                         "Discovered device: Type=%s, Version=%s, WiFi=%s, IP=%s, MAC=%s",
-                        device["device_type"],
-                        device["version"],
-                        device["wifi_name"],
-                        device["ip"],
-                        device["mac"],
+                        device_info.device_type,
+                        device_info.version,
+                        device_info.wifi_name,
+                        device_info.ip,
+                        device_info.mac,
                     )
         except OSError as err:
             _LOGGER.error("Device discovery failed: %s", err)
@@ -499,10 +489,10 @@ class MarstekUDPClient:
 
     async def get_device_info(
         self, device_ip: str, *, timeout: float = 5.0
-    ) -> dict[str, Any]:
+    ) -> MarstekDeviceInfo:
         """Fetch device information from a specific host."""
         response = await self.send_request(discover(), device_ip, timeout=timeout)
         result = response.get("result") if isinstance(response, dict) else None
         if not isinstance(result, dict):
             raise TypeError("No device information returned")
-        return result
+        return MarstekDeviceInfo.from_response(result, device_ip)
