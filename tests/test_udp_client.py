@@ -6,7 +6,7 @@ from typing import Any
 
 import pytest
 
-from aiomarstek import MarstekDeviceInfo, MarstekUDPClient
+from aiomarstek import MarstekDeviceInfo, MarstekDeviceStatus, MarstekUDPClient
 
 
 def _device_result(**overrides: Any) -> dict[str, Any]:
@@ -135,6 +135,45 @@ async def test_get_device_info_requires_result(
 
     with pytest.raises(TypeError):
         await client.get_device_info("192.168.1.5")
+
+
+async def test_get_device_status_returns_normalized_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Status responses are parsed by the library before being returned."""
+    client = MarstekUDPClient()
+    responses = iter(
+        [
+            {"result": {"bat_soc": 90, "ongrid_power": 100, "mode": 2}},
+            {
+                "result": {
+                    "pv1_power": 42.5,
+                    "pv1_voltage": 10.5,
+                    "pv1_current": 4.25,
+                    "pv1_state": 1,
+                }
+            },
+        ]
+    )
+
+    async def fake_send_request(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        return next(responses)
+
+    monkeypatch.setattr(client, "send_request", fake_send_request)
+
+    assert await client.get_device_status("192.168.1.10", delay_ms=0) == (
+        MarstekDeviceStatus(
+            device_ip="192.168.1.10",
+            battery_soc=90,
+            battery_power=100,
+            device_mode="manual",
+            battery_status="selling",
+            pv1_power=42.5,
+            pv1_voltage=10.5,
+            pv1_current=4.25,
+            pv1_state="working",
+        )
+    )
 
 
 async def test_send_request_rejects_invalid_json() -> None:

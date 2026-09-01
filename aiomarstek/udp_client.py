@@ -12,7 +12,7 @@ from typing import Any
 
 from .command_builder import discover, get_es_mode, get_pv_status
 from .const import DEFAULT_UDP_PORT, DISCOVERY_TIMEOUT
-from .models import MarstekDeviceInfo
+from .models import MarstekDeviceInfo, MarstekDeviceStatus
 
 _LOGGER = logging.getLogger(__name__)
 _SOCKET_FACTORY = socket.socket
@@ -379,111 +379,51 @@ class MarstekUDPClient:
         self,
         device_ip: str,
         *,
-        previous_data: dict[str, Any] | None = None,
+        previous_data: MarstekDeviceStatus | None = None,
         timeout: float = 2.5,
         delay_ms: int = 2000,
-    ) -> dict[str, Any]:
+    ) -> MarstekDeviceStatus:
         """Fetch device status and PV data."""
-        current_data = previous_data or {}
-        result_data = {
-            "battery_soc": current_data.get("battery_soc", 0),
-            "battery_power": current_data.get("battery_power", 0),
-            "device_mode": current_data.get("device_mode", "Unknown"),
-            "battery_status": current_data.get("battery_status", "Unknown"),
-            "device_ip": device_ip,
-            "last_update": asyncio.get_running_loop().time(),
-            "pv1_power": current_data.get("pv1_power", 0),
-            "pv1_voltage": current_data.get("pv1_voltage", 0),
-            "pv1_current": current_data.get("pv1_current", 0),
-            "pv1_state": current_data.get("pv1_state", 0),
-            "pv2_power": current_data.get("pv2_power", 0),
-            "pv2_voltage": current_data.get("pv2_voltage", 0),
-            "pv2_current": current_data.get("pv2_current", 0),
-            "pv2_state": current_data.get("pv2_state", 0),
-            "pv3_power": current_data.get("pv3_power", 0),
-            "pv3_voltage": current_data.get("pv3_voltage", 0),
-            "pv3_current": current_data.get("pv3_current", 0),
-            "pv3_state": current_data.get("pv3_state", 0),
-            "pv4_power": current_data.get("pv4_power", 0),
-            "pv4_voltage": current_data.get("pv4_voltage", 0),
-            "pv4_current": current_data.get("pv4_current", 0),
-            "pv4_state": current_data.get("pv4_state", 0),
-        }
+        result_data = previous_data or MarstekDeviceStatus(device_ip=device_ip)
 
         async def delay(ms: int) -> None:
             await asyncio.sleep(ms / 1000.0)
 
-        async def es_status_request() -> bool:
+        async def es_status_request() -> None:
+            nonlocal result_data
             try:
                 mode_as_status_result = await self.send_request(
                     get_es_mode(0),
                     device_ip,
                     timeout=timeout,
                 )
-                status_data = mode_as_status_result.get("result", {})
+            except (TimeoutError, OSError):
+                return
+            status_data = mode_as_status_result.get("result")
+            if not isinstance(status_data, dict):
+                raise TypeError("ES.GetMode response must contain a result object")
+            result_data = result_data.with_es_mode_response(status_data)
 
-                battery_soc = status_data.get(
-                    "bat_soc", result_data.get("battery_soc", 0)
-                )
-                result_data["battery_soc"] = battery_soc
-                ongrid_power = status_data.get(
-                    "ongrid_power", result_data.get("battery_power", 0)
-                )
-                result_data["battery_power"] = abs(ongrid_power)
-                result_data["device_mode"] = status_data.get("mode", "Unknown")
-                if ongrid_power > 0:
-                    result_data["battery_status"] = "Selling"
-                elif ongrid_power < 0:
-                    result_data["battery_status"] = "Charging"
-                else:
-                    result_data["battery_status"] = "Idle"
-            except (TimeoutError, OSError, ValueError):
-                return False
-            return True
-
-        async def pv_status_request() -> bool:
+        async def pv_status_request() -> None:
+            nonlocal result_data
             try:
                 pv_status_result = await self.send_request(
                     get_pv_status(0),
                     device_ip,
                     timeout=timeout,
                 )
-                pv_data = pv_status_result.get("result", {})
+            except (TimeoutError, OSError):
+                return
+            pv_data = pv_status_result.get("result")
+            if not isinstance(pv_data, dict):
+                raise TypeError("PV.GetStatus response must contain a result object")
+            result_data = result_data.with_pv_status_response(pv_data)
 
-                for key in (
-                    "pv1_power",
-                    "pv1_voltage",
-                    "pv1_current",
-                    "pv1_state",
-                    "pv2_power",
-                    "pv2_voltage",
-                    "pv2_current",
-                    "pv2_state",
-                    "pv3_power",
-                    "pv3_voltage",
-                    "pv3_current",
-                    "pv3_state",
-                    "pv4_power",
-                    "pv4_voltage",
-                    "pv4_current",
-                    "pv4_state",
-                ):
-                    result_data[key] = pv_data.get(key, result_data.get(key, 0))
-            except (TimeoutError, OSError, ValueError):
-                return False
-            return True
-
-        try:
-            await es_status_request()
-        except (TimeoutError, OSError, ValueError) as err:
-            _LOGGER.error("Device %s ES.GetMode request failed: %s", device_ip, err)
+        await es_status_request()
 
         await delay(delay_ms)
 
-        try:
-            await pv_status_request()
-        except (TimeoutError, OSError, ValueError) as err:
-            _LOGGER.error("Device %s PV.GetStatus request failed: %s", device_ip, err)
+        await pv_status_request()
 
         return result_data
 
