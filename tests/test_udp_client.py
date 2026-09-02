@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 import pytest
@@ -142,9 +143,11 @@ async def test_get_device_status_returns_normalized_model(
 ) -> None:
     """Status responses are parsed by the library before being returned."""
     client = MarstekUDPClient()
+    requests: list[dict[str, object]] = []
     responses = iter(
         [
-            {"result": {"bat_soc": 90, "ongrid_power": 100, "mode": 2}},
+            {"result": {"bat_soc": 90, "ongrid_power": 100}},
+            {"result": {"mode": 2}},
             {
                 "result": {
                     "pv1_power": 42.5,
@@ -157,6 +160,7 @@ async def test_get_device_status_returns_normalized_model(
     )
 
     async def fake_send_request(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        requests.append(json.loads(args[0]))
         return next(responses)
 
     monkeypatch.setattr(client, "send_request", fake_send_request)
@@ -174,6 +178,44 @@ async def test_get_device_status_returns_normalized_model(
             pv1_state="working",
         )
     )
+
+
+async def test_get_device_status_tolerates_unsupported_pv_status(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Devices without PV.GetStatus still return ES status data."""
+    client = MarstekUDPClient()
+    requests: list[dict[str, object]] = []
+    responses = iter(
+        [
+            {"result": {"bat_soc": 90, "ongrid_power": -100}},
+            {"result": {"mode": 0}},
+            {"error": {"code": -32601, "message": "Method not found"}},
+        ]
+    )
+
+    async def fake_send_request(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        requests.append(json.loads(args[0]))
+        return next(responses)
+
+    monkeypatch.setattr(client, "send_request", fake_send_request)
+
+    assert await client.get_device_status("192.168.1.10", delay_ms=0) == (
+        MarstekDeviceStatus(
+            device_ip="192.168.1.10",
+            battery_soc=90,
+            battery_power=100,
+            device_mode="auto",
+            battery_status="charging",
+        )
+    )
+    assert [
+        (request["method"], request["params"]) for request in requests
+    ] == [
+        ("ES.GetStatus", {"id": 0}),
+        ("ES.GetMode", {"id": 1}),
+        ("PV.GetStatus", {"id": 0}),
+    ]
 
 
 async def test_send_request_rejects_invalid_json() -> None:

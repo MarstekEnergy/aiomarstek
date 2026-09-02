@@ -10,7 +10,7 @@ from collections.abc import Iterable
 from contextlib import suppress
 from typing import Any
 
-from .command_builder import discover, get_es_mode, get_pv_status
+from .command_builder import discover, get_es_mode, get_es_status, get_pv_status
 from .const import DEFAULT_UDP_PORT, DISCOVERY_TIMEOUT
 from .models import MarstekDeviceInfo, MarstekDeviceStatus
 
@@ -392,17 +392,32 @@ class MarstekUDPClient:
         async def es_status_request() -> None:
             nonlocal result_data
             try:
-                mode_as_status_result = await self.send_request(
-                    get_es_mode(0),
+                es_status_result = await self.send_request(
+                    get_es_status(0),
                     device_ip,
                     timeout=timeout,
                 )
             except (TimeoutError, OSError):
                 return
-            status_data = mode_as_status_result.get("result")
+            status_data = es_status_result.get("result")
             if not isinstance(status_data, dict):
-                raise TypeError("ES.GetMode response must contain a result object")
-            result_data = result_data.with_es_mode_response(status_data)
+                return
+            result_data = result_data.with_es_status_response(status_data)
+
+        async def es_mode_request() -> None:
+            nonlocal result_data
+            try:
+                mode_result = await self.send_request(
+                    get_es_mode(1),
+                    device_ip,
+                    timeout=timeout,
+                )
+            except (TimeoutError, OSError):
+                return
+            mode_data = mode_result.get("result")
+            if not isinstance(mode_data, dict):
+                return
+            result_data = result_data.with_es_mode_response(mode_data)
 
         async def pv_status_request() -> None:
             nonlocal result_data
@@ -416,13 +431,12 @@ class MarstekUDPClient:
                 return
             pv_data = pv_status_result.get("result")
             if not isinstance(pv_data, dict):
-                raise TypeError("PV.GetStatus response must contain a result object")
+                return
             result_data = result_data.with_pv_status_response(pv_data)
 
         await es_status_request()
-
+        await es_mode_request()
         await delay(delay_ms)
-
         await pv_status_request()
 
         return result_data

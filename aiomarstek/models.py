@@ -113,6 +113,31 @@ class MarstekDeviceStatus:
             battery_status=battery_status,
         )
 
+    def with_es_status_response(
+        self, response: Mapping[str, object]
+    ) -> MarstekDeviceStatus:
+        """Return status updated with an ES.GetStatus response."""
+        battery_soc = _response_number(response, "bat_soc", self.battery_soc)
+        ongrid_power = _response_number(response, "ongrid_power", self.battery_power)
+
+        battery_status = self.battery_status
+        if "ongrid_power" in response:
+            if ongrid_power is None:
+                battery_status = None
+            elif ongrid_power > 0:
+                battery_status = "selling"
+            elif ongrid_power < 0:
+                battery_status = "charging"
+            else:
+                battery_status = "idle"
+
+        return replace(
+            self,
+            battery_soc=battery_soc,
+            battery_power=abs(ongrid_power) if ongrid_power is not None else None,
+            battery_status=battery_status,
+        )
+
     def with_pv_status_response(
         self, response: Mapping[str, object]
     ) -> MarstekDeviceStatus:
