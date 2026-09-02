@@ -39,6 +39,8 @@ class MarstekUDPClient:
         self._polling_paused: dict[str, bool] = {}
         self._polling_lock: asyncio.Lock = asyncio.Lock()
         self._broadcast_addresses = list(broadcast_addresses or ["255.255.255.255"])
+        self._es_mode_device_ids: dict[str, int] = {}
+        self._pv_status_supported: dict[str, bool] = {}
 
     def set_broadcast_addresses(self, addresses: Iterable[str]) -> None:
         """Set broadcast addresses used for discovery."""
@@ -396,6 +398,7 @@ class MarstekUDPClient:
                     get_es_status(0),
                     device_ip,
                     timeout=timeout,
+                    quiet_on_timeout=True,
                 )
             except (TimeoutError, OSError):
                 return
@@ -406,21 +409,29 @@ class MarstekUDPClient:
 
         async def es_mode_request() -> None:
             nonlocal result_data
-            try:
-                mode_result = await self.send_request(
-                    get_es_mode(1),
-                    device_ip,
-                    timeout=timeout,
-                )
-            except (TimeoutError, OSError):
+            preferred_id = self._es_mode_device_ids.get(device_ip, 1)
+            device_ids = (preferred_id, 1 - preferred_id)
+            for device_id in device_ids:
+                try:
+                    mode_result = await self.send_request(
+                        get_es_mode(device_id),
+                        device_ip,
+                        timeout=timeout,
+                        quiet_on_timeout=True,
+                    )
+                except (TimeoutError, OSError):
+                    continue
+                mode_data = mode_result.get("result")
+                if not isinstance(mode_data, dict):
+                    continue
+                self._es_mode_device_ids[device_ip] = device_id
+                result_data = result_data.with_es_mode_response(mode_data)
                 return
-            mode_data = mode_result.get("result")
-            if not isinstance(mode_data, dict):
-                return
-            result_data = result_data.with_es_mode_response(mode_data)
 
         async def pv_status_request() -> None:
             nonlocal result_data
+            if self._pv_status_supported.get(device_ip) is False:
+                return
             try:
                 pv_status_result = await self.send_request(
                     get_pv_status(0),
@@ -431,13 +442,18 @@ class MarstekUDPClient:
                 return
             pv_data = pv_status_result.get("result")
             if not isinstance(pv_data, dict):
+                error = pv_status_result.get("error")
+                if isinstance(error, dict) and error.get("code") == -32601:
+                    self._pv_status_supported[device_ip] = False
                 return
+            self._pv_status_supported[device_ip] = True
             result_data = result_data.with_pv_status_response(pv_data)
 
         await es_status_request()
         await es_mode_request()
-        await delay(delay_ms)
-        await pv_status_request()
+        if self._pv_status_supported.get(device_ip) is not False:
+            await delay(delay_ms)
+            await pv_status_request()
 
         return result_data
 

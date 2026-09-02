@@ -209,12 +209,81 @@ async def test_get_device_status_tolerates_unsupported_pv_status(
             battery_status="charging",
         )
     )
-    assert [
-        (request["method"], request["params"]) for request in requests
-    ] == [
+    assert [(request["method"], request["params"]) for request in requests] == [
         ("ES.GetStatus", {"id": 0}),
         ("ES.GetMode", {"id": 1}),
         ("PV.GetStatus", {"id": 0}),
+    ]
+
+
+async def test_get_device_status_falls_back_to_es_mode_id_zero(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Devices using ES device ID zero retain their status data."""
+    client = MarstekUDPClient()
+    requests: list[dict[str, object]] = []
+    responses = iter(
+        [
+            {"error": {"code": -32601, "message": "Method not found"}},
+            TimeoutError(),
+            {"result": {"bat_soc": 75, "ongrid_power": 50, "mode": 4}},
+            {"error": {"code": -32601, "message": "Method not found"}},
+        ]
+    )
+
+    async def fake_send_request(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        requests.append(json.loads(args[0]))
+        response = next(responses)
+        if isinstance(response, BaseException):
+            raise response
+        return response
+
+    monkeypatch.setattr(client, "send_request", fake_send_request)
+
+    assert await client.get_device_status("192.168.1.11", delay_ms=0) == (
+        MarstekDeviceStatus(
+            device_ip="192.168.1.11",
+            battery_soc=75,
+            battery_power=50,
+            device_mode="ups",
+            battery_status="selling",
+        )
+    )
+    assert [(request["method"], request["params"]) for request in requests] == [
+        ("ES.GetStatus", {"id": 0}),
+        ("ES.GetMode", {"id": 1}),
+        ("ES.GetMode", {"id": 0}),
+        ("PV.GetStatus", {"id": 0}),
+    ]
+
+
+async def test_get_device_status_skips_known_unsupported_pv_status(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A device rejecting PV.GetStatus is not queried again."""
+    client = MarstekUDPClient()
+    requests: list[dict[str, object]] = []
+
+    async def fake_send_request(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        request = json.loads(args[0])
+        requests.append(request)
+        if request["method"] == "PV.GetStatus":
+            return {"error": {"code": -32601, "message": "Method not found"}}
+        if request["method"] == "ES.GetStatus":
+            return {"result": {"bat_soc": 90}}
+        return {"result": {"mode": 0}}
+
+    monkeypatch.setattr(client, "send_request", fake_send_request)
+
+    await client.get_device_status("192.168.1.10", delay_ms=0)
+    await client.get_device_status("192.168.1.10", delay_ms=0)
+
+    assert [request["method"] for request in requests] == [
+        "ES.GetStatus",
+        "ES.GetMode",
+        "PV.GetStatus",
+        "ES.GetStatus",
+        "ES.GetMode",
     ]
 
 
