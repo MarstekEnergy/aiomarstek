@@ -85,6 +85,7 @@ class MarstekDeviceStatus:
     pv4_voltage: MarstekStatusNumber | None = None
     pv4_current: MarstekStatusNumber | None = None
     pv4_state: str | None = None
+    total_pv_energy: MarstekStatusNumber | None = None
 
     def with_es_mode_response(
         self, response: Mapping[str, object]
@@ -119,6 +120,9 @@ class MarstekDeviceStatus:
         """Return status updated with an ES.GetStatus response."""
         battery_soc = _response_number(response, "bat_soc", self.battery_soc)
         ongrid_power = _response_number(response, "ongrid_power", self.battery_power)
+        total_pv_energy = _response_scaled_number(
+            response, "total_pv_energy", self.total_pv_energy, 10
+        )
 
         battery_status = self.battery_status
         if "ongrid_power" in response:
@@ -136,6 +140,7 @@ class MarstekDeviceStatus:
             battery_soc=battery_soc,
             battery_power=abs(ongrid_power) if ongrid_power is not None else None,
             battery_status=battery_status,
+            total_pv_energy=total_pv_energy,
         )
 
     def with_pv_status_response(
@@ -187,6 +192,19 @@ def _response_number(
     if isinstance(value, bool) or not isinstance(value, int | float):
         raise TypeError(f"{key} must be a number or null")
     return value
+
+
+def _response_scaled_number(
+    response: Mapping[str, object],
+    key: str,
+    previous_value: MarstekStatusNumber | None,
+    scale: int | float,
+) -> MarstekStatusNumber | None:
+    """Return a numeric response field converted to its normalized unit."""
+    if key not in response:
+        return previous_value
+    value = _response_number(response, key, None)
+    return value * scale if value is not None else None
 
 
 def _response_mode(

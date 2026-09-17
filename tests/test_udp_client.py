@@ -146,7 +146,13 @@ async def test_get_device_status_returns_normalized_model(
     requests: list[dict[str, object]] = []
     responses = iter(
         [
-            {"result": {"bat_soc": 90, "ongrid_power": 100}},
+            {
+                "result": {
+                    "bat_soc": 90,
+                    "ongrid_power": 100,
+                    "total_pv_energy": 281,
+                }
+            },
             {"result": {"mode": 2}},
             {
                 "result": {
@@ -172,6 +178,7 @@ async def test_get_device_status_returns_normalized_model(
             battery_power=100,
             device_mode="manual",
             battery_status="selling",
+            total_pv_energy=2810,
             pv1_power=42.5,
             pv1_voltage=10.5,
             pv1_current=4.25,

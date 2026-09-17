@@ -46,6 +46,7 @@ def test_device_status_parses_protocol_values() -> None:
     status = status.with_es_mode_response(
         {"bat_soc": 98, "ongrid_power": -100.5, "mode": "Auto"}
     )
+    status = status.with_es_status_response({"total_pv_energy": 281})
     status = status.with_pv_status_response(
         {
             "pv1_power": 42.5,
@@ -59,11 +60,14 @@ def test_device_status_parses_protocol_values() -> None:
     assert status.battery_power == 100.5
     assert status.device_mode == "auto"
     assert status.battery_status == "charging"
+    assert status.total_pv_energy == 2810
     assert status.pv1_power == 42.5
     assert status.pv1_voltage == 10.5
     assert status.pv1_current == 4.25
     assert status.pv1_state == "working"
     assert status.has_value("pv2_power") is False
+
+    assert status.with_es_status_response({}).total_pv_energy == 2810
 
 
 @pytest.mark.parametrize(
@@ -73,6 +77,11 @@ def test_device_status_parses_protocol_values() -> None:
         pytest.param({"ongrid_power": True}, "ongrid_power", id="boolean_power"),
         pytest.param({"mode": "unsupported"}, "mode", id="unknown_mode"),
         pytest.param({"pv1_state": 2}, "pv1_state", id="unknown_pv_state"),
+        pytest.param(
+            {"total_pv_energy": "12345"},
+            "total_pv_energy",
+            id="numeric_energy_string",
+        ),
     ],
 )
 def test_device_status_rejects_invalid_protocol_values(
@@ -84,5 +93,7 @@ def test_device_status_rejects_invalid_protocol_values(
     with pytest.raises(TypeError, match=match):
         if "pv1_state" in response:
             status.with_pv_status_response(response)
+        elif "total_pv_energy" in response:
+            status.with_es_status_response(response)
         else:
             status.with_es_mode_response(response)
