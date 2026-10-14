@@ -86,6 +86,10 @@ class MarstekDeviceStatus:
     pv4_current: MarstekStatusNumber | None = None
     pv4_state: str | None = None
     total_pv_energy: MarstekStatusNumber | None = None
+    total_grid_output_energy: MarstekStatusNumber | None = None
+    total_grid_input_energy: MarstekStatusNumber | None = None
+    total_load_energy: MarstekStatusNumber | None = None
+    battery_energy: MarstekStatusNumber | None = None
 
     def with_es_mode_response(
         self, response: Mapping[str, object]
@@ -120,9 +124,25 @@ class MarstekDeviceStatus:
         """Return status updated with an ES.GetStatus response."""
         battery_soc = _response_number(response, "bat_soc", self.battery_soc)
         ongrid_power = _response_number(response, "ongrid_power", self.battery_power)
+        # The Open API reports PV energy in 0.01 kWh and the other energy
+        # counters in Wh. Firmware 301 resets all of them at midnight, so
+        # they are today's totals despite their names.
         total_pv_energy = _response_scaled_number(
             response, "total_pv_energy", self.total_pv_energy, 10
         )
+        total_grid_output_energy = _response_number(
+            response, "total_grid_output_energy", self.total_grid_output_energy
+        )
+        total_grid_input_energy = _response_number(
+            response, "total_grid_input_energy", self.total_grid_input_energy
+        )
+        total_load_energy = _response_number(
+            response, "total_load_energy", self.total_load_energy
+        )
+        # The Open API calls bat_cap the total capacity, but firmware 301
+        # reports the energy left in the battery, in Wh: the same value as
+        # Bat.GetStatus bat_capacity.
+        battery_energy = _response_number(response, "bat_cap", self.battery_energy)
 
         battery_status = self.battery_status
         if "ongrid_power" in response:
@@ -141,6 +161,10 @@ class MarstekDeviceStatus:
             battery_power=abs(ongrid_power) if ongrid_power is not None else None,
             battery_status=battery_status,
             total_pv_energy=total_pv_energy,
+            total_grid_output_energy=total_grid_output_energy,
+            total_grid_input_energy=total_grid_input_energy,
+            total_load_energy=total_load_energy,
+            battery_energy=battery_energy,
         )
 
     def with_pv_status_response(
