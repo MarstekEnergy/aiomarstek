@@ -22,6 +22,9 @@ from .const import (
 from .models import MarstekDeviceInfo, MarstekDeviceStatus
 
 _LOGGER = logging.getLogger(__name__)
+# Devices without PV inputs (e.g. Venus E) silently ignore PV.GetStatus instead
+# of returning a method-not-found error, so give up after this many timeouts.
+_PV_STATUS_MAX_TIMEOUTS = 3
 _SOCKET_FACTORY = socket.socket
 
 
@@ -48,6 +51,8 @@ class MarstekUDPClient:
         self._broadcast_addresses = list(broadcast_addresses or ["255.255.255.255"])
         self._es_mode_device_ids: dict[str, int] = {}
         self._pv_status_supported: dict[str, bool] = {}
+        self._pv_status_timeouts: dict[str, int] = {}
+
         self._last_response_times: dict[str, datetime] = {}
         self._last_results: dict[str, dict[str, dict[str, Any]]] = {}
 
@@ -413,8 +418,12 @@ class MarstekUDPClient:
 
         async def es_mode_request() -> None:
             nonlocal result_data
-            preferred_id = self._es_mode_device_ids.get(device_ip, 1)
-            device_ids = (preferred_id, 1 - preferred_id)
+            # Once the device has answered one ES.GetMode device ID, keep using
+            # only that one so an unresponsive device is not asked twice.
+            if (known_id := self._es_mode_device_ids.get(device_ip)) is not None:
+                device_ids: tuple[int, ...] = (known_id,)
+            else:
+                device_ids = (1, 0)
             for device_id in device_ids:
                 try:
                     mode_result = await self.send_request(
@@ -442,9 +451,25 @@ class MarstekUDPClient:
                     get_pv_status(0),
                     device_ip,
                     timeout=timeout,
+                    quiet_on_timeout=True,
                 )
-            except (TimeoutError, OSError):
+            except TimeoutError:
+                timeouts = self._pv_status_timeouts.get(device_ip, 0) + 1
+                self._pv_status_timeouts[device_ip] = timeouts
+                if (
+                    timeouts >= _PV_STATUS_MAX_TIMEOUTS
+                    and device_ip not in self._pv_status_supported
+                ):
+                    _LOGGER.info(
+                        "Device %s does not answer PV.GetStatus, "
+                        "assuming it has no PV inputs",
+                        device_ip,
+                    )
+                    self._pv_status_supported[device_ip] = False
                 return
+            except OSError:
+                return
+            self._pv_status_timeouts.pop(device_ip, None)
             pv_data = pv_status_result.get("result")
             if not isinstance(pv_data, dict):
                 error = pv_status_result.get("error")

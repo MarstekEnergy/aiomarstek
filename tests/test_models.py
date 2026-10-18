@@ -169,3 +169,13 @@ def test_device_status_rejects_invalid_protocol_values(
             status.with_es_status_response(response)
         else:
             status.with_es_mode_response(response)
+
+
+def test_device_status_parses_battery_energy() -> None:
+    """bat_cap is the energy left in the battery, in Wh."""
+    status = MarstekDeviceStatus(device_ip="192.168.1.10").with_es_status_response(
+        {"bat_cap": 218}
+    )
+
+    assert status.battery_energy == 218
+    assert status.with_es_status_response({}).battery_energy == 218
