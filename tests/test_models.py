@@ -221,6 +221,58 @@ def test_hold_glitches_without_previous_returns_current() -> None:
     assert hold_glitches(None, current) is current
 
 
+def test_hold_glitches_tracks_counters_separately() -> None:
+    """One counter resetting does not let another's drop through."""
+    previous = MarstekDeviceStatus(
+        device_ip="192.168.1.10",
+        total_pv_energy=1000,
+        total_grid_output_energy=2000,
+    )
+    current = MarstekDeviceStatus(
+        device_ip="192.168.1.10",
+        total_pv_energy=1000,
+        total_grid_output_energy=5,
+    )
+    held = hold_glitches(
+        previous, current, falling_energy_polls={"total_grid_output_energy": 0}
+    )
+    assert held.total_pv_energy == 1000
+    assert held.total_grid_output_energy == 2000
+
+
+def test_hold_glitches_accepts_one_reset_but_holds_another() -> None:
+    """A counter past the escape threshold passes while another is still held."""
+    previous = MarstekDeviceStatus(
+        device_ip="192.168.1.10",
+        total_pv_energy=1000,
+        total_grid_output_energy=2000,
+    )
+    current = MarstekDeviceStatus(
+        device_ip="192.168.1.10",
+        total_pv_energy=0,
+        total_grid_output_energy=5,
+    )
+    held = hold_glitches(
+        previous,
+        current,
+        falling_energy_polls={
+            "total_pv_energy": FALLING_ENERGY_POLLS,
+            "total_grid_output_energy": 0,
+        },
+    )
+    assert held.total_pv_energy == 0
+    assert held.total_grid_output_energy == 2000
+
+
+def test_hold_glitches_holds_missing_counter_without_counting_it() -> None:
+    """A missing value is held at the last reading and never escapes."""
+    previous = MarstekDeviceStatus(device_ip="192.168.1.10", total_pv_energy=1000)
+    current = MarstekDeviceStatus(device_ip="192.168.1.10", total_pv_energy=None)
+
+    held = hold_glitches(previous, current, falling_energy_polls=FALLING_ENERGY_POLLS)
+    assert held.total_pv_energy == 1000
+
+
 @pytest.mark.parametrize(
     ("response", "match"),
     [

@@ -57,6 +57,10 @@ class MarstekUDPClient:
         """Return the latest raw result of each status request, by method."""
         return dict(self._last_results.get(device_ip, {}))
 
+    def is_pv_status_supported(self, device_ip: str) -> bool | None:
+        """Return whether the device answers PV.GetStatus, or None if unknown."""
+        return self._pv_status_supported.get(device_ip)
+
     def _record_response(
         self, device_ip: str, method: str, result: dict[str, Any]
     ) -> None:

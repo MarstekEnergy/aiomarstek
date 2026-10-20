@@ -490,3 +490,29 @@ async def test_get_device_status_skips_pv_when_disabled(
     await client.get_device_status("192.168.1.10", delay_ms=0, include_pv=False)
 
     assert pv_requests == 0
+
+
+async def test_is_pv_status_supported_reflects_device_capability(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PV support is None until the device answers or refuses PV.GetStatus."""
+    client = MarstekUDPClient()
+    pv_answer = True
+
+    async def fake_send_request(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        if json.loads(args[0])["method"] == "PV.GetStatus":
+            if pv_answer:
+                return {"result": {"pv1_power": 10}}
+            return {"error": {"code": -32601}}
+        return {"result": {"bat_soc": 90, "mode": 0}}
+
+    monkeypatch.setattr(client, "send_request", fake_send_request)
+
+    assert client.is_pv_status_supported("192.168.1.10") is None
+
+    await client.get_device_status("192.168.1.10", delay_ms=0)
+    assert client.is_pv_status_supported("192.168.1.10") is True
+
+    pv_answer = False
+    await client.get_device_status("192.168.1.10", delay_ms=0)
+    assert client.is_pv_status_supported("192.168.1.10") is False

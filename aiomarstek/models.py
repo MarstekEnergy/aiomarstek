@@ -204,7 +204,7 @@ def hold_glitches(
     previous: MarstekDeviceStatus | None,
     current: MarstekDeviceStatus,
     zero_soc_polls: int = 0,
-    falling_energy_polls: int = 0,
+    falling_energy_polls: int | Mapping[str, int] = 0,
 ) -> MarstekDeviceStatus:
     """Keep previous values where the firmware reports implausible readings.
 
@@ -214,19 +214,27 @@ def hold_glitches(
     reply shows up neither as a spike nor as a phantom meter reset. Both are
     accepted as real once they repeat over several polls; the caller counts
     those polls and passes the counts as ``zero_soc_polls`` and
-    ``falling_energy_polls``.
+    ``falling_energy_polls``. Counter polls are tracked per counter, so one
+    counter resetting does not let another's drop through. A missing value
+    (``None``) is held at the last reading but does not count as a drop.
     """
     if previous is None:
         return current
+    per_key = (
+        falling_energy_polls if isinstance(falling_energy_polls, Mapping) else None
+    )
     held: dict[str, MarstekStatusValue | None] = {}
     for key in MONOTONIC_KEYS:
         old, new = getattr(previous, key), getattr(current, key)
-        if (
-            old is not None
-            and (new is None or new < old)
-            and falling_energy_polls < FALLING_ENERGY_POLLS
-        ):
+        if old is None:
+            continue
+        if new is None:
             held[key] = old
+            continue
+        if new < old:
+            polls = per_key.get(key, 0) if per_key is not None else falling_energy_polls
+            if polls < FALLING_ENERGY_POLLS:
+                held[key] = old
     if (
         current.battery_soc == 0
         and (previous.battery_soc or 0) >= SOC_GLITCH_FLOOR
