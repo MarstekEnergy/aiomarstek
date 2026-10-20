@@ -2,7 +2,12 @@
 
 import pytest
 
-from aiomarstek import MarstekDeviceInfo, MarstekDeviceStatus
+from aiomarstek import (
+    ZERO_SOC_POLLS,
+    MarstekDeviceInfo,
+    MarstekDeviceStatus,
+    hold_glitches,
+)
 
 
 def test_device_info_parses_discovery_response() -> None:
@@ -140,6 +145,59 @@ def test_device_status_parses_energy_totals() -> None:
     assert status.total_grid_input_energy == 456
     assert status.total_load_energy == 46
     assert status.with_es_status_response({}).total_grid_input_energy == 456
+
+
+def test_hold_glitches_passes_through_lifetime_counters() -> None:
+    """Lifetime counters are returned unchanged, including decreasing ones.
+
+    The recorder of Home Assistant treats a lower TOTAL_INCREASING reading
+    as a meter reset, so a real reset is handled there, not held here.
+    """
+    previous = MarstekDeviceStatus(
+        device_ip="192.168.1.10",
+        total_pv_energy=1000,
+        total_grid_output_energy=2000,
+        total_grid_input_energy=3000,
+    )
+    current = MarstekDeviceStatus(
+        device_ip="192.168.1.10",
+        total_pv_energy=0,
+        total_grid_output_energy=5,
+        total_grid_input_energy=None,
+    )
+
+    assert hold_glitches(previous, current) is current
+
+
+def test_hold_glitches_keeps_soc_spike_to_zero() -> None:
+    """A 0 % reading straight after a high level is held."""
+    previous = MarstekDeviceStatus(device_ip="192.168.1.10", battery_soc=50)
+    current = MarstekDeviceStatus(device_ip="192.168.1.10", battery_soc=0)
+
+    assert hold_glitches(previous, current).battery_soc == 50
+
+
+def test_hold_glitches_accepts_zero_soc_after_repeats() -> None:
+    """0 % is accepted once it repeats over several polls."""
+    previous = MarstekDeviceStatus(device_ip="192.168.1.10", battery_soc=50)
+    current = MarstekDeviceStatus(device_ip="192.168.1.10", battery_soc=0)
+
+    assert hold_glitches(previous, current, ZERO_SOC_POLLS).battery_soc == 0
+
+
+def test_hold_glitches_accepts_zero_soc_from_low_level() -> None:
+    """A drop to 0 % from below the glitch floor is taken as is."""
+    previous = MarstekDeviceStatus(device_ip="192.168.1.10", battery_soc=5)
+    current = MarstekDeviceStatus(device_ip="192.168.1.10", battery_soc=0)
+
+    assert hold_glitches(previous, current).battery_soc == 0
+
+
+def test_hold_glitches_without_previous_returns_current() -> None:
+    """The first reading is returned unchanged."""
+    current = MarstekDeviceStatus(device_ip="192.168.1.10", battery_soc=0)
+
+    assert hold_glitches(None, current) is current
 
 
 @pytest.mark.parametrize(

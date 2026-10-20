@@ -14,6 +14,7 @@ import pytest
 from aiomarstek import (
     MarstekDeviceInfo,
     MarstekDeviceStatus,
+    MarstekNoResponse,
     MarstekUDPClient,
     discover,
     get_es_status,
@@ -411,10 +412,10 @@ async def test_broadcast_collects_simultaneous_responses(
     assert client._broadcast_responses == {}
 
 
-async def test_get_device_status_records_last_response_time(
+async def test_get_device_status_raises_when_silent(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The last response time only moves when the device answers."""
+    """A silent device raises MarstekNoResponse; recorded results are unchanged."""
     client = MarstekUDPClient()
     answer = True
 
@@ -427,19 +428,20 @@ async def test_get_device_status_records_last_response_time(
 
     monkeypatch.setattr(client, "send_request", fake_send_request)
 
-    assert client.get_last_response_time("192.168.1.10") is None
     await client.get_device_status("192.168.1.10", delay_ms=0)
-    first = client.get_last_response_time("192.168.1.10")
     assert client.get_last_results("192.168.1.10") == {
         "ES.GetStatus": {"bat_soc": 90, "mode": 0},
         "ES.GetMode": {"bat_soc": 90, "mode": 0},
     }
-    assert first is not None
-    assert first.tzinfo is not None
 
     answer = False
-    await client.get_device_status("192.168.1.10", delay_ms=0)
-    assert client.get_last_response_time("192.168.1.10") == first
+    with pytest.raises(MarstekNoResponse):
+        await client.get_device_status("192.168.1.10", delay_ms=0)
+    # The silent call added nothing to the recorded results.
+    assert client.get_last_results("192.168.1.10") == {
+        "ES.GetStatus": {"bat_soc": 90, "mode": 0},
+        "ES.GetMode": {"bat_soc": 90, "mode": 0},
+    }
 
 
 async def test_get_device_status_skips_pv_when_disabled(

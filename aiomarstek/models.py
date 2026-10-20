@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
-from typing import TypeAlias
+from typing import Final, TypeAlias
 
 MarstekDeviceVersion: TypeAlias = int | str
 MarstekStatusNumber: TypeAlias = int | float
@@ -18,6 +18,12 @@ _DEVICE_MODE_MAP = {
     4: "ups",
 }
 _PV_STATE_MAP = {0: "standby", 1: "working"}
+
+# A battery level this high cannot drop to 0 % within one poll.
+SOC_GLITCH_FLOOR: Final = 10
+# Polls in a row reporting 0 % after which the reading is accepted as real,
+# so a device that is really empty is not held at its last level forever.
+ZERO_SOC_POLLS: Final = 3
 
 
 @dataclass(frozen=True, slots=True)
@@ -124,8 +130,8 @@ class MarstekDeviceStatus:
         battery_soc = _response_number(response, "bat_soc", self.battery_soc)
         ongrid_power = _response_number(response, "ongrid_power", self.battery_power)
         # The Open API reports PV energy in 0.01 kWh and the other energy
-        # counters in Wh. Firmware 301 resets all of them at midnight, so
-        # they are today's totals despite their names.
+        # counters in Wh. They are lifetime totals and never reset, so a
+        # lower reading is a device glitch (see hold_glitches).
         total_pv_energy = _response_scaled_number(
             response, "total_pv_energy", self.total_pv_energy, 10
         )
@@ -181,6 +187,36 @@ class MarstekDeviceStatus:
     def get_value(self, key: str) -> MarstekStatusValue | None:
         """Return a normalized status value."""
         return getattr(self, key)
+
+
+def hold_glitches(
+    previous: MarstekDeviceStatus | None,
+    current: MarstekDeviceStatus,
+    zero_soc_polls: int = 0,
+) -> MarstekDeviceStatus:
+    """Keep the previous battery level where the firmware reports a glitch.
+
+    The firmware occasionally reports a battery level of 0 % right after a
+    reading of 10 % or more. Such a reading is held at its previous value,
+    so a single bad reply does not show up as a spike. A battery level of
+    0 % is accepted as real once it repeats over several polls; the caller
+    counts those polls and passes the count as ``zero_soc_polls``.
+
+    Lifetime energy counters are passed through unchanged. The sensors that
+    expose them use ``SensorStateClass.TOTAL_INCREASING``, for which Home
+    Assistant treats a lower reading as a meter reset and starts a new
+    accumulation, so a real reset is handled by the recorder rather than
+    held here.
+    """
+    if previous is None:
+        return current
+    if (
+        current.battery_soc == 0
+        and (previous.battery_soc or 0) >= SOC_GLITCH_FLOOR
+        and zero_soc_polls < ZERO_SOC_POLLS
+    ):
+        return replace(current, battery_soc=previous.battery_soc)
+    return current
 
 
 def _string_value(value: object, default: str = "") -> str:

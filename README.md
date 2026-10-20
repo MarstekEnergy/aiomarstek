@@ -9,7 +9,11 @@ Async client library for local Marstek device communication.
 
 `aiomarstek` contains the UDP protocol, command builder, discovery cache,
 polling pause handling, and high-level status helpers used by the Home Assistant
-Marstek integration.
+Marstek integration. `hold_glitches` keeps the previous battery level where the
+firmware reports an implausible spike to 0 %, so every consumer of the library
+gets the same protection. Lifetime energy counters are passed through unchanged;
+the sensors expose them as `TOTAL_INCREASING`, for which Home Assistant treats a
+lower reading as a meter reset.
 
 ## Installation
 
