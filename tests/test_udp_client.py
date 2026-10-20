@@ -444,6 +444,34 @@ async def test_get_device_status_raises_when_silent(
     }
 
 
+async def test_get_device_status_records_partial_answers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Methods that stay silent drop out of the recorded results."""
+    client = MarstekUDPClient()
+    es_status_answer = True
+
+    async def fake_send_request(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        if not es_status_answer and json.loads(args[0])["method"] == "ES.GetStatus":
+            raise TimeoutError
+        if json.loads(args[0])["method"] == "PV.GetStatus":
+            return {"error": {"code": -32601}}
+        return {"result": {"bat_soc": 90, "mode": 0}}
+
+    monkeypatch.setattr(client, "send_request", fake_send_request)
+
+    await client.get_device_status("192.168.1.10", delay_ms=0)
+    assert set(client.get_last_results("192.168.1.10")) == {
+        "ES.GetStatus",
+        "ES.GetMode",
+    }
+
+    es_status_answer = False
+    await client.get_device_status("192.168.1.10", delay_ms=0)
+    # Only the methods that answered this poll are recorded.
+    assert set(client.get_last_results("192.168.1.10")) == {"ES.GetMode"}
+
+
 async def test_get_device_status_skips_pv_when_disabled(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

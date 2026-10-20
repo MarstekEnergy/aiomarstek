@@ -392,6 +392,12 @@ class MarstekUDPClient:
         """
         result_data = previous_data or MarstekDeviceStatus(device_ip=device_ip)
         answered = False
+        # The recorded results double as a freshness snapshot: each poll
+        # starts from scratch, so afterwards they hold exactly the methods
+        # that answered this poll. A fully silent poll restores the previous
+        # snapshot, so diagnostics keep the last raw replies received.
+        snapshot = self._last_results.get(device_ip, {})
+        self._last_results[device_ip] = {}
 
         async def delay(ms: int) -> None:
             await asyncio.sleep(ms / 1000.0)
@@ -467,6 +473,7 @@ class MarstekUDPClient:
             await pv_status_request()
 
         if not answered:
+            self._last_results[device_ip] = snapshot
             raise MarstekNoResponse(device_ip)
         return result_data
 

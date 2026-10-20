@@ -24,6 +24,17 @@ SOC_GLITCH_FLOOR: Final = 10
 # Polls in a row reporting 0 % after which the reading is accepted as real,
 # so a device that is really empty is not held at its last level forever.
 ZERO_SOC_POLLS: Final = 3
+# Lifetime counters that only ever grow on a healthy device; the Open API
+# documents them as cumulative totals that only a factory reset clears.
+MONOTONIC_KEYS: Final = (
+    "total_pv_energy",
+    "total_grid_output_energy",
+    "total_grid_input_energy",
+)
+# Polls in a row a counter has to stay below its previous reading before the
+# drop is accepted as a real reset: a single dip is a device glitch, which
+# would otherwise show up as a phantom meter reset in accumulating stats.
+FALLING_ENERGY_POLLS: Final = 2
 
 
 @dataclass(frozen=True, slots=True)
@@ -193,29 +204,37 @@ def hold_glitches(
     previous: MarstekDeviceStatus | None,
     current: MarstekDeviceStatus,
     zero_soc_polls: int = 0,
+    falling_energy_polls: int = 0,
 ) -> MarstekDeviceStatus:
-    """Keep the previous battery level where the firmware reports a glitch.
+    """Keep previous values where the firmware reports implausible readings.
 
     The firmware occasionally reports a battery level of 0 % right after a
-    reading of 10 % or more. Such a reading is held at its previous value,
-    so a single bad reply does not show up as a spike. A battery level of
-    0 % is accepted as real once it repeats over several polls; the caller
-    counts those polls and passes the count as ``zero_soc_polls``.
-
-    Lifetime energy counters are passed through unchanged. The sensors that
-    expose them use ``SensorStateClass.TOTAL_INCREASING``, for which Home
-    Assistant treats a lower reading as a meter reset and starts a new
-    accumulation, so a real reset is handled by the recorder rather than
-    held here.
+    reading of 10 % or more, and a lifetime counter below its previous
+    reading. Such readings are held at their previous value, so a single bad
+    reply shows up neither as a spike nor as a phantom meter reset. Both are
+    accepted as real once they repeat over several polls; the caller counts
+    those polls and passes the counts as ``zero_soc_polls`` and
+    ``falling_energy_polls``.
     """
     if previous is None:
         return current
+    held: dict[str, MarstekStatusValue | None] = {}
+    for key in MONOTONIC_KEYS:
+        old, new = getattr(previous, key), getattr(current, key)
+        if (
+            old is not None
+            and (new is None or new < old)
+            and falling_energy_polls < FALLING_ENERGY_POLLS
+        ):
+            held[key] = old
     if (
         current.battery_soc == 0
         and (previous.battery_soc or 0) >= SOC_GLITCH_FLOOR
         and zero_soc_polls < ZERO_SOC_POLLS
     ):
-        return replace(current, battery_soc=previous.battery_soc)
+        held["battery_soc"] = previous.battery_soc
+    if held:
+        return replace(current, **held)
     return current
 
 

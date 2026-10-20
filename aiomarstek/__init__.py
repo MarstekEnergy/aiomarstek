@@ -22,6 +22,8 @@ from .const import (
     DISCOVERY_TIMEOUT,
 )
 from .models import (
+    FALLING_ENERGY_POLLS,
+    MONOTONIC_KEYS,
     SOC_GLITCH_FLOOR,
     ZERO_SOC_POLLS,
     MarstekDeviceInfo,
@@ -41,6 +43,8 @@ __all__ = [
     "CMD_PV_GET_STATUS",
     "DEFAULT_UDP_PORT",
     "DISCOVERY_TIMEOUT",
+    "FALLING_ENERGY_POLLS",
+    "MONOTONIC_KEYS",
     "SOC_GLITCH_FLOOR",
     "ZERO_SOC_POLLS",
     "MarstekDeviceInfo",

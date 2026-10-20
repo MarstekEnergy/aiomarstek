@@ -3,6 +3,7 @@
 import pytest
 
 from aiomarstek import (
+    FALLING_ENERGY_POLLS,
     ZERO_SOC_POLLS,
     MarstekDeviceInfo,
     MarstekDeviceStatus,
@@ -147,12 +148,8 @@ def test_device_status_parses_energy_totals() -> None:
     assert status.with_es_status_response({}).total_grid_input_energy == 456
 
 
-def test_hold_glitches_passes_through_lifetime_counters() -> None:
-    """Lifetime counters are returned unchanged, including decreasing ones.
-
-    The recorder of Home Assistant treats a lower TOTAL_INCREASING reading
-    as a meter reset, so a real reset is handled there, not held here.
-    """
+def test_hold_glitches_keeps_single_counter_dip() -> None:
+    """A counter below its previous reading is held for a single poll."""
     previous = MarstekDeviceStatus(
         device_ip="192.168.1.10",
         total_pv_energy=1000,
@@ -165,6 +162,30 @@ def test_hold_glitches_passes_through_lifetime_counters() -> None:
         total_grid_output_energy=5,
         total_grid_input_energy=None,
     )
+
+    held = hold_glitches(previous, current)
+    assert held.total_pv_energy == 1000
+    assert held.total_grid_output_energy == 2000
+    assert held.total_grid_input_energy == 3000
+
+
+def test_hold_glitches_accepts_counter_reset_after_repeats() -> None:
+    """A counter drop is accepted once it persists over several polls."""
+    previous = MarstekDeviceStatus(device_ip="192.168.1.10", total_pv_energy=1000)
+    current = MarstekDeviceStatus(device_ip="192.168.1.10", total_pv_energy=0)
+
+    assert (
+        hold_glitches(
+            previous, current, falling_energy_polls=FALLING_ENERGY_POLLS
+        ).total_pv_energy
+        == 0
+    )
+
+
+def test_hold_glitches_passes_through_rising_counters() -> None:
+    """Counters at or above their previous reading are returned as is."""
+    previous = MarstekDeviceStatus(device_ip="192.168.1.10", total_pv_energy=1000)
+    current = MarstekDeviceStatus(device_ip="192.168.1.10", total_pv_energy=1005)
 
     assert hold_glitches(previous, current) is current
 
