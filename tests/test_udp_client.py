@@ -167,6 +167,16 @@ async def test_get_device_status_returns_normalized_model(
             {"result": {"mode": 2}},
             {
                 "result": {
+                    "soc": 90,
+                    "charg_flag": True,
+                    "dischrg_flag": False,
+                    "bat_temp": 25.5,
+                    "bat_capacity": 256.0,
+                    "rated_capacity": 2560.0,
+                }
+            },
+            {
+                "result": {
                     "pv1_power": 42.5,
                     "pv1_voltage": 10.5,
                     "pv1_current": 4.25,
@@ -189,6 +199,12 @@ async def test_get_device_status_returns_normalized_model(
             battery_power=100,
             device_mode="manual",
             battery_status="selling",
+            ongrid_power=100,
+            battery_temperature=25.5,
+            battery_remaining_capacity=256.0,
+            battery_rated_capacity=2560.0,
+            charge_permission=True,
+            discharge_permission=False,
             total_pv_energy=2810,
             pv1_power=42.5,
             pv1_voltage=10.5,
@@ -196,6 +212,12 @@ async def test_get_device_status_returns_normalized_model(
             pv1_state="working",
         )
     )
+    assert [request["method"] for request in requests] == [
+        "ES.GetStatus",
+        "ES.GetMode",
+        "Bat.GetStatus",
+        "PV.GetStatus",
+    ]
 
 
 async def test_get_device_status_tolerates_unsupported_pv_status(
@@ -208,6 +230,7 @@ async def test_get_device_status_tolerates_unsupported_pv_status(
         [
             {"result": {"bat_soc": 90, "ongrid_power": -100}},
             {"result": {"mode": 0}},
+            {"result": {"soc": 90}},
             {"error": {"code": -32601, "message": "Method not found"}},
         ]
     )
@@ -225,11 +248,13 @@ async def test_get_device_status_tolerates_unsupported_pv_status(
             battery_power=100,
             device_mode="auto",
             battery_status="charging",
+            ongrid_power=-100,
         )
     )
     assert [(request["method"], request["params"]) for request in requests] == [
         ("ES.GetStatus", {"id": 0}),
         ("ES.GetMode", {"id": 1}),
+        ("Bat.GetStatus", {"id": 0}),
         ("PV.GetStatus", {"id": 0}),
     ]
 
@@ -245,6 +270,7 @@ async def test_get_device_status_falls_back_to_es_mode_id_zero(
             {"error": {"code": -32601, "message": "Method not found"}},
             TimeoutError(),
             {"result": {"bat_soc": 75, "ongrid_power": 50, "mode": 4}},
+            {"result": {"soc": 75}},
             {"error": {"code": -32601, "message": "Method not found"}},
         ]
     )
@@ -265,12 +291,14 @@ async def test_get_device_status_falls_back_to_es_mode_id_zero(
             battery_power=50,
             device_mode="ups",
             battery_status="selling",
+            ongrid_power=50,
         )
     )
     assert [(request["method"], request["params"]) for request in requests] == [
         ("ES.GetStatus", {"id": 0}),
         ("ES.GetMode", {"id": 1}),
         ("ES.GetMode", {"id": 0}),
+        ("Bat.GetStatus", {"id": 0}),
         ("PV.GetStatus", {"id": 0}),
     ]
 
@@ -299,9 +327,11 @@ async def test_get_device_status_skips_known_unsupported_pv_status(
     assert [request["method"] for request in requests] == [
         "ES.GetStatus",
         "ES.GetMode",
+        "Bat.GetStatus",
         "PV.GetStatus",
         "ES.GetStatus",
         "ES.GetMode",
+        "Bat.GetStatus",
     ]
 
 
@@ -341,7 +371,7 @@ async def loopback_client(
     monkeypatch: pytest.MonkeyPatch,
 ) -> AsyncIterator[tuple[MarstekUDPClient, socket.socket, list[int]]]:
     """Client listening on an ephemeral loopback socket with sends captured."""
-    client = MarstekUDPClient()
+    client = MarstekUDPClient(verify_source_ip=False)
     client._socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     client._socket.bind(("127.0.0.1", 0))
     client._socket.setblocking(False)
@@ -432,6 +462,7 @@ async def test_get_device_status_raises_when_silent(
     assert client.get_last_results("192.168.1.10") == {
         "ES.GetStatus": {"bat_soc": 90, "mode": 0},
         "ES.GetMode": {"bat_soc": 90, "mode": 0},
+        "Bat.GetStatus": {"bat_soc": 90, "mode": 0},
     }
 
     answer = False
@@ -441,6 +472,7 @@ async def test_get_device_status_raises_when_silent(
     assert client.get_last_results("192.168.1.10") == {
         "ES.GetStatus": {"bat_soc": 90, "mode": 0},
         "ES.GetMode": {"bat_soc": 90, "mode": 0},
+        "Bat.GetStatus": {"bat_soc": 90, "mode": 0},
     }
 
 
@@ -464,12 +496,16 @@ async def test_get_device_status_records_partial_answers(
     assert set(client.get_last_results("192.168.1.10")) == {
         "ES.GetStatus",
         "ES.GetMode",
+        "Bat.GetStatus",
     }
 
     es_status_answer = False
     await client.get_device_status("192.168.1.10", delay_ms=0)
     # Only the methods that answered this poll are recorded.
-    assert set(client.get_last_results("192.168.1.10")) == {"ES.GetMode"}
+    assert set(client.get_last_results("192.168.1.10")) == {
+        "ES.GetMode",
+        "Bat.GetStatus",
+    }
 
 
 async def test_get_device_status_skips_pv_when_disabled(
@@ -516,3 +552,482 @@ async def test_is_pv_status_supported_reflects_device_capability(
     pv_answer = False
     await client.get_device_status("192.168.1.10", delay_ms=0)
     assert client.is_pv_status_supported("192.168.1.10") is False
+
+
+async def test_get_device_status_throttles_extras(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """WiFi, BLE and EM are only queried every EXTRAS_INTERVAL polls."""
+    from aiomarstek import EXTRAS_INTERVAL
+
+    client = MarstekUDPClient()
+    requests: list[str] = []
+
+    async def fake_send_request(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        request = json.loads(args[0])
+        requests.append(request["method"])
+        if request["method"] == "PV.GetStatus":
+            return {"error": {"code": -32601}}
+        if request["method"] == "Wifi.GetStatus":
+            return {"result": {"rssi": -59, "ssid": "home"}}
+        if request["method"] == "BLE.GetStatus":
+            return {"result": {"state": "connect"}}
+        if request["method"] == "EM.GetStatus":
+            return {"result": {"ct_state": 1, "total_power": 120}}
+        if request["method"] == "ES.GetStatus":
+            return {"result": {"bat_soc": 90}}
+        return {"result": {"mode": 0}}
+
+    monkeypatch.setattr(client, "send_request", fake_send_request)
+
+    for _ in range(EXTRAS_INTERVAL):
+        await client.get_device_status("192.168.1.10", delay_ms=0)
+
+    assert requests.count("Wifi.GetStatus") == 1
+    assert requests.count("BLE.GetStatus") == 1
+    assert requests.count("EM.GetStatus") == 1
+    assert requests.count("Bat.GetStatus") == EXTRAS_INTERVAL
+
+    await client.get_device_status("192.168.1.10", delay_ms=0)
+    assert requests.count("Wifi.GetStatus") == 1
+
+
+async def test_get_device_status_merges_extras(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """WiFi, BLE and EM responses populate the normalized status."""
+    from aiomarstek import EXTRAS_INTERVAL
+
+    client = MarstekUDPClient()
+    client._extras_age["192.168.1.10"] = EXTRAS_INTERVAL - 1
+
+    async def fake_send_request(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        request = json.loads(args[0])
+        if request["method"] == "PV.GetStatus":
+            return {"error": {"code": -32601}}
+        if request["method"] == "Wifi.GetStatus":
+            return {
+                "result": {
+                    "ssid": "home",
+                    "rssi": -59,
+                    "sta_ip": "192.168.1.10",
+                    "sta_gate": "192.168.1.1",
+                    "sta_mask": "255.255.255.0",
+                    "sta_dns": "192.168.1.1",
+                }
+            }
+        if request["method"] == "BLE.GetStatus":
+            return {"result": {"state": "connect"}}
+        if request["method"] == "EM.GetStatus":
+            return {
+                "result": {
+                    "ct_state": 1,
+                    "a_power": 10,
+                    "b_power": 20,
+                    "c_power": 30,
+                    "total_power": 60,
+                    "input_energy": 3086320,
+                    "output_energy": 4487510,
+                }
+            }
+        if request["method"] == "ES.GetStatus":
+            return {"result": {"bat_soc": 90}}
+        return {"result": {"mode": 0}}
+
+    monkeypatch.setattr(client, "send_request", fake_send_request)
+
+    status = await client.get_device_status("192.168.1.10", delay_ms=0)
+
+    assert status.wifi_ssid == "home"
+    assert status.wifi_rssi == -59
+    assert status.wifi_ip == "192.168.1.10"
+    assert status.wifi_gateway == "192.168.1.1"
+    assert status.wifi_netmask == "255.255.255.0"
+    assert status.wifi_dns == "192.168.1.1"
+    assert status.ble_state == "connect"
+    assert status.ct_state is True
+    assert status.a_power == 10
+    assert status.b_power == 20
+    assert status.c_power == 30
+    assert status.total_power == 60
+    assert status.ct_input_energy == 308632.0
+    assert status.ct_output_energy == 448751.0
+
+
+async def test_get_device_status_marks_unsupported_extras(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Extras answering "method not found" are skipped afterwards."""
+    client = MarstekUDPClient()
+    client._extras_age["192.168.1.10"] = 99  # Force the extras cycle.
+    requests: list[str] = []
+
+    async def fake_send_request(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        request = json.loads(args[0])
+        requests.append(request["method"])
+        if request["method"] in ("Wifi.GetStatus", "BLE.GetStatus", "EM.GetStatus"):
+            return {"error": {"code": -32601, "message": "Method not found"}}
+        if request["method"] == "PV.GetStatus":
+            return {"error": {"code": -32601}}
+        if request["method"] == "ES.GetStatus":
+            return {"result": {"bat_soc": 90}}
+        return {"result": {"mode": 0}}
+
+    monkeypatch.setattr(client, "send_request", fake_send_request)
+
+    status = await client.get_device_status("192.168.1.10", delay_ms=0)
+    assert status.wifi_rssi is None
+    assert status.ble_state is None
+
+    client._extras_age["192.168.1.10"] = 99  # Due again on the next poll.
+    await client.get_device_status("192.168.1.10", delay_ms=0)
+    assert requests.count("Wifi.GetStatus") == 1
+    assert requests.count("BLE.GetStatus") == 1
+    assert requests.count("EM.GetStatus") == 1
+
+
+async def test_get_device_status_skips_battery_when_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """include_battery=False never sends Bat.GetStatus."""
+    client = MarstekUDPClient()
+    battery_requests = 0
+
+    async def fake_send_request(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        nonlocal battery_requests
+        if json.loads(args[0])["method"] == "Bat.GetStatus":
+            battery_requests += 1
+        return {"result": {"bat_soc": 90, "mode": 0}}
+
+    monkeypatch.setattr(client, "send_request", fake_send_request)
+
+    await client.get_device_status("192.168.1.10", delay_ms=0, include_battery=False)
+
+    assert battery_requests == 0
+
+
+async def _drive_listen(
+    client: MarstekUDPClient,
+    packets: list[tuple[bytes, tuple[str, int]]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Run _listen_for_responses over a fixed packet list, then stop it."""
+    client._socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    iterator = iter(packets)
+
+    async def fake_recvfrom(
+        sock: object, bufsize: int
+    ) -> tuple[bytes, tuple[str, int]]:
+        try:
+            return next(iterator)
+        except StopIteration:
+            raise asyncio.CancelledError from None
+
+    monkeypatch.setattr(
+        asyncio.get_running_loop(), "sock_recvfrom", fake_recvfrom, raising=False
+    )
+    try:
+        await client._listen_for_responses()
+    finally:
+        client._socket.close()
+        client._socket = None
+
+
+async def test_listen_drops_non_utf8_packet(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-UTF-8 packet is dropped without killing the listener."""
+    client = MarstekUDPClient(verify_source_ip=False)
+    await _drive_listen(client, [(b"\xff\xfe\x00", ("1.2.3.4", 9))], monkeypatch)
+    # Reaching here means the listener did not crash on the bad packet.
+
+
+async def test_listen_drops_malformed_json_packet(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Invalid JSON degrades to a raw payload without killing the listener."""
+    client = MarstekUDPClient(verify_source_ip=False)
+    await _drive_listen(client, [(b"not json", ("1.2.3.4", 9))], monkeypatch)
+
+
+async def test_unicast_response_from_wrong_source_is_dropped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A unicast reply from a host other than the target is not resolved."""
+    client = MarstekUDPClient(verify_source_ip=True)
+    loop = asyncio.get_running_loop()
+    future: asyncio.Future = loop.create_future()
+    client._pending_requests[42] = (future, "1.2.3.4")
+
+    await _drive_listen(
+        client,
+        [(json.dumps({"id": 42, "result": {}}).encode(), ("9.9.9.9", 9))],
+        monkeypatch,
+    )
+
+    assert not future.done()
+    assert 42 in client._pending_requests
+
+
+async def test_unicast_response_from_right_source_is_resolved(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A unicast reply from the target host resolves the waiting future."""
+    client = MarstekUDPClient(verify_source_ip=True)
+    loop = asyncio.get_running_loop()
+    future: asyncio.Future = loop.create_future()
+    client._pending_requests[42] = (future, "1.2.3.4")
+
+    await _drive_listen(
+        client,
+        [
+            (
+                json.dumps({"id": 42, "result": {"ok": 1}}).encode(),
+                ("1.2.3.4", 9),
+            )
+        ],
+        monkeypatch,
+    )
+
+    assert future.result() == {"id": 42, "result": {"ok": 1}}
+    assert 42 not in client._pending_requests
+
+
+async def test_get_device_status_raises_when_polling_paused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A paused device skips the poll and raises MarstekNoResponse."""
+    client = MarstekUDPClient()
+    calls = 0
+
+    async def fake_send_request(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        nonlocal calls
+        calls += 1
+        return {"result": {}}
+
+    monkeypatch.setattr(client, "send_request", fake_send_request)
+    await client.pause_polling("1.2.3.4")
+
+    with pytest.raises(MarstekNoResponse):
+        await client.get_device_status("1.2.3.4", delay_ms=0)
+
+    assert calls == 0
+
+
+async def test_polling_pause_count_overlaps() -> None:
+    """Overlapping pauses only resume once every one has finished."""
+    client = MarstekUDPClient()
+    assert not client.is_polling_paused("1.2.3.4")
+    await client.pause_polling("1.2.3.4")
+    await client.pause_polling("1.2.3.4")
+    assert client.is_polling_paused("1.2.3.4")
+    await client.resume_polling("1.2.3.4")
+    assert client.is_polling_paused("1.2.3.4")
+    await client.resume_polling("1.2.3.4")
+    assert not client.is_polling_paused("1.2.3.4")
+
+
+async def test_discover_devices_raises_on_network_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A broadcast failure is raised, not returned as an empty list."""
+    client = MarstekUDPClient()
+
+    async def failing_broadcast(*args: Any, **kwargs: Any) -> list[dict[str, Any]]:
+        raise OSError("boom")
+
+    monkeypatch.setattr(client, "send_broadcast_request", failing_broadcast)
+
+    with pytest.raises(OSError):
+        await client.discover_devices(use_cache=False)
+
+    assert client.get_discovery_cache() is None
+
+
+async def test_discover_devices_caches_empty_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A genuine empty result is cached so the next call does not re-broadcast."""
+    client = MarstekUDPClient()
+    calls = 0
+
+    async def fake_broadcast(*args: Any, **kwargs: Any) -> list[dict[str, Any]]:
+        nonlocal calls
+        calls += 1
+        return []
+
+    monkeypatch.setattr(client, "send_broadcast_request", fake_broadcast)
+
+    first = await client.discover_devices()
+    second = await client.discover_devices()
+
+    assert first == []
+    assert second == []
+    assert calls == 1
+
+
+def _per_poll_status(responses: list[dict[str, Any] | None]) -> Any:
+    """Fake send_request serving one ES.GetStatus response per poll.
+
+    A None entry makes every request of that poll time out, so the poll
+    raises MarstekNoResponse without updating streaks. PV.GetStatus always
+    reports unsupported so it is not queried again.
+    """
+    iterator = iter(responses)
+    latest: dict[str, Any] = {}
+    timed_out = False
+
+    async def fake_send_request(
+        message: str, *args: Any, **kwargs: Any
+    ) -> dict[str, Any]:
+        nonlocal timed_out
+        method = json.loads(message)["method"]
+        if method == "ES.GetStatus":
+            nxt = next(iterator)
+            timed_out = nxt is None
+            if timed_out:
+                raise TimeoutError
+            latest.clear()
+            latest.update(nxt)
+            return {"result": latest}
+        if timed_out:
+            raise TimeoutError
+        if method == "PV.GetStatus":
+            return {"error": {"code": -32601}}
+        return {"result": latest}
+
+    return fake_send_request
+
+
+async def test_status_smoothing_holds_soc_spike_then_recovers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A single 0% SOC reading after a high level is held, then cleared."""
+    client = MarstekUDPClient()
+    monkeypatch.setattr(
+        client,
+        "send_request",
+        _per_poll_status(
+            [
+                {"bat_soc": 50, "mode": 0},
+                {"bat_soc": 0, "mode": 0},
+                {"bat_soc": 50, "mode": 0},
+            ]
+        ),
+    )
+
+    first = await client.get_device_status("1.2.3.4", delay_ms=0)
+    second = await client.get_device_status("1.2.3.4", delay_ms=0)
+    third = await client.get_device_status("1.2.3.4", delay_ms=0)
+
+    assert first.battery_soc == 50
+    assert second.battery_soc == 50  # spike held
+    assert third.battery_soc == 50
+    assert client._zero_soc_polls["1.2.3.4"] == 0  # recovery cleared the streak
+
+
+async def test_status_smoothing_accepts_persistent_zero_soc(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """0% is accepted once it persists past the escape threshold."""
+    client = MarstekUDPClient()
+    monkeypatch.setattr(
+        client,
+        "send_request",
+        _per_poll_status(
+            [
+                {"bat_soc": 50, "mode": 0},
+                {"bat_soc": 0, "mode": 0},
+                {"bat_soc": 0, "mode": 0},
+                {"bat_soc": 0, "mode": 0},
+                {"bat_soc": 0, "mode": 0},
+            ]
+        ),
+    )
+
+    results = [await client.get_device_status("1.2.3.4", delay_ms=0) for _ in range(5)]
+    assert [r.battery_soc for r in results] == [50, 50, 50, 50, 0]
+
+
+async def test_status_smoothing_holds_energy_dip_then_accepts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A monotonic counter dip is held, then accepted past the threshold."""
+    client = MarstekUDPClient()
+    monkeypatch.setattr(
+        client,
+        "send_request",
+        _per_poll_status(
+            [
+                {"total_pv_energy": 1000},
+                {"total_pv_energy": 5},
+                {"total_pv_energy": 5},
+                {"total_pv_energy": 5},
+            ]
+        ),
+    )
+
+    results = [await client.get_device_status("1.2.3.4", delay_ms=0) for _ in range(4)]
+    # total_pv_energy is scaled by 10: 1000 -> 10000, 5 -> 50.
+    assert results[0].total_pv_energy == 10000
+    assert results[1].total_pv_energy == 10000  # dip held
+    assert results[2].total_pv_energy == 10000  # dip still held
+    assert results[3].total_pv_energy == 50  # accepted past the threshold
+
+
+async def test_status_smoothing_isolates_devices(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Each device keeps its own streak; one device's spike does not affect another."""
+    client = MarstekUDPClient()
+    polls = {
+        "10.0.0.1": iter([{"bat_soc": 50, "mode": 0}, {"bat_soc": 0, "mode": 0}]),
+        "10.0.0.2": iter([{"bat_soc": 80, "mode": 0}, {"bat_soc": 0, "mode": 0}]),
+    }
+    latest: dict[str, dict[str, Any]] = {"10.0.0.1": {}, "10.0.0.2": {}}
+
+    async def fake_send_request(
+        message: str, target_ip: str, *args: Any, **kwargs: Any
+    ) -> dict[str, Any]:
+        method = json.loads(message)["method"]
+        if method == "PV.GetStatus":
+            return {"error": {"code": -32601}}
+        if method == "ES.GetStatus":
+            latest[target_ip].clear()
+            latest[target_ip].update(next(polls[target_ip]))
+        return {"result": latest[target_ip]}
+
+    monkeypatch.setattr(client, "send_request", fake_send_request)
+
+    a1 = await client.get_device_status("10.0.0.1", delay_ms=0)
+    b1 = await client.get_device_status("10.0.0.2", delay_ms=0)
+    a2 = await client.get_device_status("10.0.0.1", delay_ms=0)
+    b2 = await client.get_device_status("10.0.0.2", delay_ms=0)
+
+    assert a1.battery_soc == 50
+    assert b1.battery_soc == 80
+    assert a2.battery_soc == 50  # A's spike held
+    assert b2.battery_soc == 80  # B's spike held independently
+    assert client._zero_soc_polls["10.0.0.1"] == 1
+    assert client._zero_soc_polls["10.0.0.2"] == 1
+
+
+async def test_status_smoothing_survives_failed_poll(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed poll does not clear the streak; the next spike is still held."""
+    client = MarstekUDPClient()
+    monkeypatch.setattr(
+        client,
+        "send_request",
+        _per_poll_status([{"bat_soc": 50, "mode": 0}, None, {"bat_soc": 0, "mode": 0}]),
+    )
+
+    first = await client.get_device_status("1.2.3.4", delay_ms=0)
+    with pytest.raises(MarstekNoResponse):
+        await client.get_device_status("1.2.3.4", delay_ms=0)
+    third = await client.get_device_status("1.2.3.4", delay_ms=0)
+
+    assert first.battery_soc == 50
+    assert third.battery_soc == 50  # spike held; the silent poll kept the streak
+    assert client._zero_soc_polls["1.2.3.4"] == 1

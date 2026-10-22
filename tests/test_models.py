@@ -4,9 +4,16 @@ import pytest
 
 from aiomarstek import (
     FALLING_ENERGY_POLLS,
+    MANUAL_SET_AUTO,
+    MANUAL_SLOT_MAX,
+    MODE_AUTO,
+    MODE_MANUAL,
+    MODE_PASSIVE,
     ZERO_SOC_POLLS,
     MarstekDeviceInfo,
     MarstekDeviceStatus,
+    MarstekManualSlot,
+    MarstekModeConfig,
     hold_glitches,
 )
 
@@ -300,3 +307,100 @@ def test_device_status_rejects_invalid_protocol_values(
             status.with_es_status_response(response)
         else:
             status.with_es_mode_response(response)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [pytest.param(float("nan"), id="nan"), pytest.param(float("inf"), id="inf")],
+)
+def test_device_status_rejects_non_finite_numbers(value: float) -> None:
+    """NaN and Infinity are not valid sensor readings and are rejected."""
+    status = MarstekDeviceStatus(device_ip="192.168.1.10")
+    with pytest.raises(ValueError, match="finite"):
+        status.with_es_status_response({"bat_soc": value})
+
+
+def test_manual_slot_rejects_time_num_out_of_range() -> None:
+    """time_num must stay within the documented slot range."""
+    with pytest.raises(ValueError, match="time_num"):
+        MarstekManualSlot(
+            time_num=MANUAL_SLOT_MAX + 1,
+            start_time="00:00",
+            end_time="01:00",
+            week_set=0,
+            power=100,
+        )
+
+
+def test_manual_slot_rejects_negative_week_set() -> None:
+    """week_set must be non-negative."""
+    with pytest.raises(ValueError, match="week_set"):
+        MarstekManualSlot(
+            time_num=0,
+            start_time="00:00",
+            end_time="01:00",
+            week_set=-1,
+            power=100,
+        )
+
+
+def test_manual_slot_rejects_empty_times() -> None:
+    """start_time and end_time must be non-empty."""
+    with pytest.raises(ValueError, match="start_time"):
+        MarstekManualSlot(
+            time_num=0,
+            start_time="",
+            end_time="01:00",
+            week_set=0,
+            power=100,
+        )
+
+
+def test_manual_slot_rejects_unknown_manual_set() -> None:
+    """manual_set must be one of the documented 0..3 values."""
+    with pytest.raises(ValueError, match="manual_set"):
+        MarstekManualSlot(
+            time_num=0,
+            start_time="00:00",
+            end_time="01:00",
+            week_set=0,
+            power=100,
+            manual_set=MANUAL_SET_AUTO + 1,
+        )
+
+
+def test_manual_slot_accepts_valid_slot() -> None:
+    """A slot within all ranges constructs and serializes without error."""
+    slot = MarstekManualSlot(
+        time_num=MANUAL_SLOT_MAX,
+        start_time="00:00",
+        end_time="23:59",
+        week_set=127,
+        power=100,
+        manual_set=MANUAL_SET_AUTO,
+    )
+    assert slot.to_payload()["manual_set"] == MANUAL_SET_AUTO
+
+
+def test_mode_config_rejects_unknown_mode() -> None:
+    """mode must be one of the documented mode names."""
+    with pytest.raises(ValueError, match="mode"):
+        MarstekModeConfig(mode="bogus")
+
+
+def test_mode_config_requires_slots_in_manual() -> None:
+    """manual mode requires at least one manual slot."""
+    with pytest.raises(ValueError, match="manual mode"):
+        MarstekModeConfig(mode=MODE_MANUAL)
+
+
+def test_mode_config_requires_passive_config_in_passive() -> None:
+    """passive mode requires a passive config."""
+    with pytest.raises(ValueError, match="passive mode"):
+        MarstekModeConfig(mode=MODE_PASSIVE)
+
+
+def test_mode_config_accepts_valid_auto() -> None:
+    """A valid auto config serializes without error."""
+    config = MarstekModeConfig(mode=MODE_AUTO)
+    assert config.to_payload()["mode"] == "Auto"
