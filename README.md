@@ -43,6 +43,28 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
+## Security considerations
+
+The protocol is unauthenticated: `build_command` emits only `id`, `method` and
+`params`, and responses carry no token or signature either. The trust boundary
+is therefore the network — any host that can reach a device's UDP port can send
+it any command, and any host can answer a broadcast discovery request.
+
+What the library does mitigate: with `verify_source_ip=True` (the default) a
+unicast response whose source address does not match the device the request was
+sent to is dropped, so another host cannot forge a status reply or fake a write
+success. That says nothing about whether the device itself validates the
+commands it receives — assume it does not until Marstek documents otherwise.
+
+- Never expose the device UDP port (default `30000`) to untrusted networks or
+  the internet; keep devices on a segment that only trusted hosts can reach.
+- The client binds `0.0.0.0:<local_port>` (default `30000`) for replies;
+  restrict inbound UDP on that port to the device addresses.
+- Discovery accepts responses from any host, so treat discovery results as
+  untrusted input.
+- Debug logging records full request/response JSON and peer addresses; disable
+  it after troubleshooting and scrub network identifiers before sharing logs.
+
 ## Development
 
 ```bash

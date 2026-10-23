@@ -6,6 +6,7 @@ import asyncio
 import json
 import socket
 from collections.abc import AsyncIterator, Callable
+from contextlib import suppress
 from typing import Any
 from unittest.mock import ANY
 
@@ -899,6 +900,101 @@ def _per_poll_status(responses: list[dict[str, Any] | None]) -> Any:
     return fake_send_request
 
 
+async def test_quiet_gap_holds_request_after_recent_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A configured gap delays the next request to a recently talking device."""
+    client = MarstekUDPClient()
+    client._min_request_gap = 2.5
+    loop = asyncio.get_running_loop()
+    client._last_response_at["1.2.3.4"] = loop.time() - 1.0
+    sleeps: list[float] = []
+
+    async def fake_sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+
+    await client._wait_for_quiet_period("1.2.3.4")
+
+    assert sleeps == [pytest.approx(1.5, abs=0.05)]
+
+
+async def test_quiet_gap_skipped_without_recent_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No wait for a device that never answered, or answered long ago."""
+    client = MarstekUDPClient()
+    client._min_request_gap = 2.5
+    slept = False
+
+    async def fake_sleep(delay: float) -> None:
+        nonlocal slept
+        slept = True
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+
+    await client._wait_for_quiet_period("1.2.3.4")  # never responded
+    client._last_response_at["1.2.3.4"] = asyncio.get_running_loop().time() - 10.0
+    await client._wait_for_quiet_period("1.2.3.4")  # long-ago response
+    client._min_request_gap = 0.0
+    client._last_response_at["1.2.3.4"] = asyncio.get_running_loop().time() - 0.1
+    await client._wait_for_quiet_period("1.2.3.4")  # gap disabled
+
+    assert slept is False
+
+
+async def test_listener_records_last_response_time(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every received packet refreshes the per-device last-response time."""
+    client = MarstekUDPClient(verify_source_ip=False)
+    loop = asyncio.get_running_loop()
+
+    await _drive_listen(
+        client,
+        [(json.dumps({"id": 7, "result": {}}).encode(), ("1.2.3.4", 9))],
+        monkeypatch,
+    )
+
+    assert client._last_response_at["1.2.3.4"] <= loop.time()
+
+
+async def test_extras_queries_are_spaced(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """WiFi, BLE and EM queries are spaced by the poll delay."""
+    client = MarstekUDPClient()
+    client._extras_age["192.168.1.10"] = 99  # Force the extras cycle.
+    sleeps: list[float] = []
+
+    async def fake_sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+
+    async def fake_send_request(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        request = json.loads(args[0])
+        method = request["method"]
+        if method == "Wifi.GetStatus":
+            return {"result": {"rssi": -59, "ssid": "home"}}
+        if method == "BLE.GetStatus":
+            return {"result": {"state": "connect"}}
+        if method == "EM.GetStatus":
+            return {"result": {"ct_state": 1, "total_power": 120}}
+        if method == "ES.GetStatus":
+            return {"result": {"bat_soc": 90}}
+        return {"result": {"mode": 0}}
+
+    monkeypatch.setattr(client, "send_request", fake_send_request)
+
+    await client.get_device_status("192.168.1.10", delay_ms=2000, include_pv=False)
+
+    # One delay between each pair of queries: es_status->es_mode,
+    # es_mode->battery, battery->extras, wifi->ble and ble->em.
+    assert sleeps.count(2.0) == 5
+
+
 async def test_status_smoothing_holds_soc_spike_then_recovers(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1031,3 +1127,352 @@ async def test_status_smoothing_survives_failed_poll(
     assert first.battery_soc == 50
     assert third.battery_soc == 50  # spike held; the silent poll kept the streak
     assert client._zero_soc_polls["1.2.3.4"] == 1
+
+
+class _FakeSock:
+    """Minimal socket double that records socket options and bind."""
+
+    def __init__(self) -> None:
+        self.opts: dict[tuple[int, int], int] = {}
+        self.bound: tuple[str, int] | None = None
+
+    def setsockopt(self, level: int, opt: int, val: int) -> None:
+        self.opts[(level, opt)] = val
+
+    def setblocking(self, flag: bool) -> None:
+        pass
+
+    def bind(self, addr: tuple[str, int]) -> None:
+        self.bound = addr
+
+    def getsockname(self) -> tuple[str, int]:
+        return self.bound or ("0.0.0.0", 30000)
+
+    def close(self) -> None:
+        pass
+
+
+async def test_setup_does_not_enable_so_reuseaddr(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The unicast socket must NOT set SO_REUSEADDR.
+
+    SO_REUSEADDR would let another socket also bind 0.0.0.0:30000 and
+    silently steal this client's unicast replies (the device replies to the
+    source port, 30000), producing "sends succeed but no replies" -- the
+    field failure this guards against.
+    """
+    fake = _FakeSock()
+    monkeypatch.setattr("aiomarstek.udp_client._SOCKET_FACTORY", lambda *a, **k: fake)
+    client = MarstekUDPClient()
+    try:
+        await client.async_setup()
+    finally:
+        await client.async_cleanup()
+
+    assert (socket.SOL_SOCKET, socket.SO_REUSEADDR) not in fake.opts
+    assert fake.opts[(socket.SOL_SOCKET, socket.SO_BROADCAST)] == 1
+    assert fake.bound == ("0.0.0.0", 30000)
+
+
+async def test_setup_bind_failure_leaves_no_socket_and_allows_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A bind failure must not leave a half-initialized socket.
+
+    The socket is created/configured/bound in a local and only assigned to
+    ``self._socket`` on success; on failure it is closed and ``self._socket``
+    stays None so a later setup is not short-circuited by the guard.
+    """
+    bind_should_fail = True
+
+    class _BindFailSock(_FakeSock):
+        def bind(self, addr: tuple[str, int]) -> None:
+            nonlocal bind_should_fail
+            if bind_should_fail:
+                bind_should_fail = False
+                raise OSError("EADDRINUSE")
+            super().bind(addr)
+
+    monkeypatch.setattr(
+        "aiomarstek.udp_client._SOCKET_FACTORY", lambda *a, **k: _BindFailSock()
+    )
+    client = MarstekUDPClient()
+
+    with pytest.raises(OSError):
+        await client.async_setup()
+
+    # No half-initialized socket left -> a retry is not short-circuited.
+    assert client._socket is None
+
+    await client.async_setup()
+    assert client._socket is not None
+    assert client._socket.bound == ("0.0.0.0", 30000)
+
+    await client.async_cleanup()
+
+
+async def test_local_port_is_distinct_from_device_target_port(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``local_port`` binds the socket; ``port`` is the device target only.
+
+    The device replies to the source port, so the local bind need not match
+    the device's port; they are independent knobs.
+    """
+    fake = _FakeSock()
+    monkeypatch.setattr("aiomarstek.udp_client._SOCKET_FACTORY", lambda *a, **k: fake)
+    client = MarstekUDPClient(port=30001, local_port=40000)
+    try:
+        await client.async_setup()
+    finally:
+        await client.async_cleanup()
+
+    # Bound to local_port, not to the device target port.
+    assert fake.bound == ("0.0.0.0", 40000)
+    assert client._port == 30001  # device target stays as configured
+    assert client._local_port == 40000
+
+
+async def test_listener_survives_dispatch_exception(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unexpected error dispatching one packet does not kill the listener."""
+    client = MarstekUDPClient(verify_source_ip=False)
+    loop = asyncio.get_running_loop()
+    future: asyncio.Future = loop.create_future()
+    client._pending_requests[42] = (future, "1.2.3.4")
+
+    calls = 0
+    real_handle = client._handle_response
+
+    def flaky_handle(data: bytes, addr: tuple[str, int]) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise ValueError("simulated dispatch bug")
+        real_handle(data, addr)
+
+    monkeypatch.setattr(client, "_handle_response", flaky_handle)
+
+    await _drive_listen(
+        client,
+        [
+            (b"first", ("1.2.3.4", 9)),
+            (json.dumps({"id": 42, "result": {"ok": 1}}).encode(), ("1.2.3.4", 9)),
+        ],
+        monkeypatch,
+    )
+
+    # The bad packet did not kill the loop; the second packet was dispatched.
+    assert calls == 2
+    assert future.result() == {"id": 42, "result": {"ok": 1}}
+
+
+async def test_consecutive_recv_errors_trigger_rebind(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Sustained OSError from recv indicates a bad socket and triggers a rebind.
+
+    The listener must rebind via ``_reopen_socket`` (not ``_rebind_socket``),
+    because it runs inside the listener task and awaiting itself would
+    deadlock. Here the spy returns False so no fresh listener is spawned;
+    the listener simply returns, proving the threshold path does not hang.
+    """
+    monkeypatch.setattr("aiomarstek.udp_client.RECV_ERROR_REBIND_THRESHOLD", 1)
+
+    client = MarstekUDPClient()
+    client._socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+    reopen_calls = 0
+
+    async def spy_reopen() -> bool:
+        nonlocal reopen_calls
+        reopen_calls += 1
+        return False  # pretend the rebind failed -> no new listener spawned
+
+    monkeypatch.setattr(client, "_reopen_socket", spy_reopen)
+
+    # Guard: _rebind_socket must NOT be called from the listener (it would
+    # cancel and await self._listen_task == this task, deadlocking).
+    rebind_calls = 0
+
+    async def spy_rebind() -> None:
+        nonlocal rebind_calls
+        rebind_calls += 1
+
+    monkeypatch.setattr(client, "_rebind_socket", spy_rebind)
+
+    recv_count = 0
+
+    async def failing_recvfrom(
+        sock: object, bufsize: int
+    ) -> tuple[bytes, tuple[str, int]]:
+        nonlocal recv_count
+        recv_count += 1
+        raise OSError("boom")
+
+    monkeypatch.setattr(
+        asyncio.get_running_loop(), "sock_recvfrom", failing_recvfrom, raising=False
+    )
+
+    await client._listen_for_responses()
+
+    assert recv_count == 1
+    assert reopen_calls == 1
+    assert rebind_calls == 0  # the listener rebound without self-awaiting
+    client._socket.close()
+    client._socket = None
+
+
+async def test_listener_rebind_from_within_spawns_new_listener(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """OSError-threshold rebind from inside the listener hands off cleanly.
+
+    A real rebind (``_reopen_socket`` succeeds) spawns a fresh listener task
+    and the old one returns -- no deadlock, no self-await. The fresh listener
+    blocks healthily on recvfrom (the normal "waiting for a reply" state).
+    """
+    monkeypatch.setattr("aiomarstek.udp_client.RECV_ERROR_REBIND_THRESHOLD", 1)
+
+    client = MarstekUDPClient()
+    client._socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+    reopened = asyncio.Event()
+
+    async def spy_reopen() -> bool:
+        reopened.set()
+        return True  # pretend the socket was reopened successfully
+
+    monkeypatch.setattr(client, "_reopen_socket", spy_reopen)
+
+    call_count = 0
+
+    async def recvfrom_once_then_block(
+        sock: object, bufsize: int
+    ) -> tuple[bytes, tuple[str, int]]:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            raise OSError("boom")  # old listener hits the threshold
+        await asyncio.Event().wait()  # fresh listener blocks healthily
+        return b"", ("", 0)
+
+    monkeypatch.setattr(
+        asyncio.get_running_loop(),
+        "sock_recvfrom",
+        recvfrom_once_then_block,
+        raising=False,
+    )
+
+    # Old listener: OSError -> rebind -> spawn fresh listener -> return.
+    await client._listen_for_responses()
+    # Let the freshly spawned listener start and reach its recvfrom.
+    await asyncio.sleep(0.05)
+
+    assert reopened.is_set()
+    assert client._listen_task is not None
+    assert not client._listen_task.done()  # fresh listener alive, blocked
+    assert call_count == 2  # old (raised) + new (blocking)
+
+    client._listen_task.cancel()
+    with suppress(asyncio.CancelledError):
+        await client._listen_task
+    client._listen_task = None
+    client._socket.close()
+    client._socket = None
+
+
+async def test_watchdog_restarts_dead_listener(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A listener task that has exited is restarted by the watchdog."""
+    fake = _FakeSock()
+    monkeypatch.setattr("aiomarstek.udp_client._SOCKET_FACTORY", lambda *a, **k: fake)
+    monkeypatch.setattr("aiomarstek.udp_client.LISTENER_WATCHDOG_INTERVAL", 0.01)
+
+    async def blocking_recvfrom(
+        sock: object, bufsize: int
+    ) -> tuple[bytes, tuple[str, int]]:
+        # A healthy listener simply blocks on recvfrom waiting for a reply.
+        await asyncio.Event().wait()
+        return b"", ("", 0)
+
+    monkeypatch.setattr(
+        asyncio.get_running_loop(), "sock_recvfrom", blocking_recvfrom, raising=False
+    )
+
+    client = MarstekUDPClient()
+    await client.async_setup()
+
+    # Stop the watchdog that async_setup started; we drive one iteration below.
+    assert client._watchdog_task is not None
+    client._watchdog_task.cancel()
+    with suppress(asyncio.CancelledError):
+        await client._watchdog_task
+    client._watchdog_task = None
+    # Drop any listener started during setup so the watchdog sees "no task".
+    if client._listen_task and not client._listen_task.done():
+        client._listen_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await client._listen_task
+    client._listen_task = None
+
+    wd = asyncio.create_task(client._listener_watchdog())
+    await asyncio.sleep(0.05)
+    wd.cancel()
+    with suppress(asyncio.CancelledError):
+        await wd
+
+    assert client._listen_task is not None
+    assert not client._listen_task.done()
+
+    await client.async_cleanup()
+
+
+async def test_watchdog_rebounds_stuck_listener(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A listener that received before but is now silent too long is rebound."""
+    fake = _FakeSock()
+    monkeypatch.setattr("aiomarstek.udp_client._SOCKET_FACTORY", lambda *a, **k: fake)
+    monkeypatch.setattr("aiomarstek.udp_client.LISTENER_WATCHDOG_INTERVAL", 0.01)
+    monkeypatch.setattr("aiomarstek.udp_client.LISTENER_STUCK_SILENCE", 0.02)
+
+    client = MarstekUDPClient()
+    await client.async_setup()
+
+    # Simulate "was receiving earlier, now long silent" without running the
+    # real listener task: mark prior traffic and an aged heartbeat.
+    client._listener_ever_received = True
+    client._listener_heartbeat = asyncio.get_running_loop().time() - 100.0
+    # Pretend the listener is alive (done()==False) so the stuck branch runs.
+    client._listen_task = asyncio.create_task(asyncio.Event().wait())
+
+    rebind_calls = 0
+
+    async def spy_rebind() -> None:
+        nonlocal rebind_calls
+        rebind_calls += 1
+
+    monkeypatch.setattr(client, "_rebind_socket", spy_rebind)
+
+    # Stop the setup watchdog; drive one watchdog tick manually.
+    assert client._watchdog_task is not None
+    client._watchdog_task.cancel()
+    with suppress(asyncio.CancelledError):
+        await client._watchdog_task
+    wd = asyncio.create_task(client._listener_watchdog())
+    await asyncio.sleep(0.05)
+    wd.cancel()
+    with suppress(asyncio.CancelledError):
+        await wd
+
+    assert rebind_calls == 1
+    assert client._stuck_rebound_done is True
+
+    client._listen_task.cancel()
+    with suppress(asyncio.CancelledError):
+        await client._listen_task
+    await client.async_cleanup()

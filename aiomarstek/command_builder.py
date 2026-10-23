@@ -21,7 +21,7 @@ from .const import (
     CMD_SET_VER,
     CMD_WIFI_STATUS,
 )
-from .models import MarstekModeConfig
+from .models import MarstekManualSlot, MarstekModeConfig
 
 _request_id = 0
 
@@ -40,7 +40,15 @@ def reset_request_id() -> None:
 
 
 def build_command(method: str, params: dict[str, Any] | None = None) -> str:
-    """Build command JSON string."""
+    """Build command JSON string.
+
+    The wire format has no authentication: a packet is only ``id``, ``method``
+    and ``params``, with no token, nonce or signature, and the device is not
+    known to verify who sent it. The trust boundary is therefore the network —
+    any host that can reach the device port can issue every command here,
+    including ``ES.SetMode`` and ``FactoryReset``. Keep devices on a segment
+    that only trusted hosts can reach; see the README's security section.
+    """
     command = {
         "id": get_next_request_id(),
         "method": method,
@@ -90,9 +98,34 @@ def get_em_status(device_id: int = 0) -> str:
 
 
 def set_es_mode(config: MarstekModeConfig, device_id: int = 0) -> str:
-    """Set device operating mode command."""
+    """Build an ES.SetMode command for the given mode config.
+
+    For non-Manual modes this is the command to send. For Manual mode this
+    emits ``manual_cfg`` as an *array* of slots (a bulk form); the Open API
+    (Rev3.1.2) documents ``manual_cfg`` as a single slot object identified by
+    ``time_num``, so per-slot setting should use :func:`set_es_mode_slot`
+    instead -- which :meth:`MarstekUDPClient.set_device_mode` does, sending
+    one ES.SetMode per slot. Use this builder for Manual only if the firmware
+    is known to accept the array form.
+    """
     return build_command(
         CMD_ES_SET_MODE, {"id": device_id, "config": config.to_payload()}
+    )
+
+
+def set_es_mode_slot(slot: MarstekManualSlot, device_id: int = 0) -> str:
+    """Build a single-slot Manual-mode ES.SetMode command.
+
+    The Open API documents ``manual_cfg`` as a single slot object
+    identified by ``time_num`` (0-9), so a Manual schedule is set one
+    slot at a time rather than as one array-valued command.
+    """
+    return build_command(
+        CMD_ES_SET_MODE,
+        {
+            "id": device_id,
+            "config": {"mode": "Manual", "manual_cfg": slot.to_payload()},
+        },
     )
 
 

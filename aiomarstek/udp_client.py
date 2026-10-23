@@ -22,6 +22,7 @@ from .command_builder import (
     set_ble_adv,
     set_dod,
     set_es_mode,
+    set_es_mode_slot,
     set_led,
     set_power_version,
 )
@@ -42,13 +43,20 @@ from .const import (
     DOD_MAX,
     DOD_MIN,
     EXTRAS_INTERVAL,
+    LISTENER_STUCK_SILENCE,
+    LISTENER_WATCHDOG_INTERVAL,
     POWER_VERSIONS,
+    RECV_ERROR_REBIND_THRESHOLD,
     TRUTHY_SET_RESULTS,
+    WRITE_MAX_RETRIES,
+    WRITE_SETTLE_MS,
 )
 from .models import (
+    MODE_MANUAL,
     MONOTONIC_KEYS,
     MarstekDeviceInfo,
     MarstekDeviceStatus,
+    MarstekManualSlot,
     MarstekModeConfig,
     hold_glitches,
 )
@@ -81,21 +89,64 @@ class MarstekUDPClient:
         broadcast_addresses: Iterable[str] | None = None,
         *,
         verify_source_ip: bool = True,
+        min_request_gap: float = 0.0,
+        local_port: int | None = None,
     ) -> None:
         """Initialize UDP client.
+
+        ``port`` is the *device target* port Marstek devices listen on
+        (default 30000); it is where requests are sent and is independent of
+        the local bind.
+
+        ``local_port`` is the port the client's own socket binds to receive
+        replies (the device replies to whatever source port we sent from, so
+        this does not need to match ``port``). Defaults to 30000 to match the
+        established behavior. Two clients in the same process must use
+        distinct ``local_port`` values, since without ``SO_REUSEADDR`` the
+        bind is exclusive; the Home Assistant integration shares a single
+        client across all devices, so this is not a constraint there.
 
         ``verify_source_ip`` drops a unicast response whose source address
         does not match the device the request was sent to, so another host
         on the LAN cannot forge a reply by guessing or observing a request
         id. Defaults to True; loopback tests and deployments behind NAT that
         rewrites source addresses may disable it.
+
+        ``min_request_gap`` is the minimum quiet time, in seconds, between
+        a device's last response and the next request sent to it. Some
+        Marstek devices silently drop a request that arrives moments after
+        their previous response; spacing requests out keeps them answered.
+        Disabled (0.0) by default; deployments talking to real devices
+        should enable it (``REQUEST_QUIET_GAP`` is the recommended value).
         """
         self._port = port
+        self._local_port = local_port if local_port is not None else DEFAULT_UDP_PORT
         self._verify_source_ip = verify_source_ip
+        self._min_request_gap = min_request_gap
+        self._last_response_at: dict[str, float] = {}
+        # Per-device write serialization and a generation counter keyed by
+        # (device_ip, method): a write queued behind an executing one is
+        # dropped only when a *newer write of the same setting* arrives, so
+        # toggling a control back and forth fires just the latest value.
+        # Different settings (e.g. LED vs DOD) never supersede each other.
+        self._write_locks: dict[str, asyncio.Lock] = {}
+        self._write_generation: dict[tuple[str, str], int] = {}
         self._socket: socket.socket | None = None
         self._pending_requests: dict[int, tuple[asyncio.Future, str]] = {}
         self._broadcast_responses: dict[int, list[dict[str, Any]]] = {}
         self._listen_task: asyncio.Task | None = None
+        # Watchdog that ensures the listener stays alive and drains the
+        # socket. A dead or stuck listener leaves sends working but replies
+        # never read (OS buffer fills, packets dropped) -- the exact symptom
+        # of "device never answers" while sendto() still succeeds.
+        self._watchdog_task: asyncio.Task | None = None
+        self._listener_heartbeat: float = 0.0
+        self._listener_ever_received: bool = False
+        self._consecutive_recv_errors: int = 0
+        # Guards against rebounding the socket more than once per "silent
+        # episode" so a device that is genuinely offline for hours does not
+        # trigger a rebind every watchdog tick. Reset to False on any packet.
+        self._stuck_rebound_done: bool = False
         self._discovery_cache: list[MarstekDeviceInfo] | None = None
         self._cache_timestamp: float = 0
         self._cache_duration: float = 30.0
@@ -138,31 +189,66 @@ class MarstekUDPClient:
         return self._discovery_cache.copy()
 
     async def async_setup(self) -> None:
-        """Setup UDP socket."""
+        """Setup UDP socket.
+
+        Binds ``local_port`` (default 30000) exclusively. Without
+        ``SO_REUSEADDR`` the bind is exclusive to this client; a duplicate
+        binder or leftover socket fails loudly with ``EADDRINUSE`` instead of
+        stealing packets. The socket is created, configured and bound in a
+        local variable and only assigned to ``self._socket`` once bind
+        succeeds, so a bind failure leaves no half-initialized socket (which
+        would otherwise short-circuit later setup attempts and leak a file
+        descriptor).
+        """
         if self._socket is not None:
             return
 
-        self._socket = _SOCKET_FACTORY(socket.AF_INET, socket.SOCK_DGRAM)
-        self._socket.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        self._socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self._socket.setblocking(False)
-        self._socket.bind(("0.0.0.0", 30000))
+        sock = _SOCKET_FACTORY(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            # SO_BROADCAST lets discovery send to the subnet broadcast address.
+            # SO_REUSEADDR is intentionally NOT set here: on Linux it would let
+            # another socket also bind this port and silently steal this
+            # client's unicast replies (the device replies to the source port),
+            # producing "sends succeed but no replies" -- the exact failure
+            # seen in the field.
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+            sock.setblocking(False)
+            sock.bind(("0.0.0.0", self._local_port))
+        except OSError:
+            sock.close()  # do not leak the file descriptor on bind failure
+            raise
+        self._socket = sock
         _LOGGER.debug(
             "UDP client bound to %s:%s",
             self._socket.getsockname()[0],
             self._socket.getsockname()[1],
         )
+        self._listener_heartbeat = asyncio.get_running_loop().time()
+        self._listener_ever_received = False
+        self._consecutive_recv_errors = 0
+        self._stuck_rebound_done = False
+        self._ensure_watchdog()
 
     async def async_cleanup(self) -> None:
         """Cleanup UDP socket."""
+        if self._watchdog_task and not self._watchdog_task.done():
+            self._watchdog_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self._watchdog_task
+        self._watchdog_task = None
+
         if self._listen_task and not self._listen_task.done():
             self._listen_task.cancel()
             with suppress(asyncio.CancelledError):
                 await self._listen_task
+        self._listen_task = None
 
         if self._socket:
             self._socket.close()
             self._socket = None
+
+        self._listener_heartbeat = 0.0
+        self._consecutive_recv_errors = 0
 
     def _is_cache_valid(self) -> bool:
         """Check if cache is valid."""
@@ -193,7 +279,7 @@ class MarstekUDPClient:
                 target_ip,
                 target_port or self._port,
                 self._local_send_ip,
-                self._port,
+                self._local_port,
                 message,
             )
         except Exception as err:
@@ -212,6 +298,7 @@ class MarstekUDPClient:
         """Send unicast request and wait for response."""
         if not self._socket:
             await self.async_setup()
+        self._ensure_watchdog()
 
         try:
             message_obj = json.loads(message)
@@ -228,6 +315,7 @@ class MarstekUDPClient:
             if not self._listen_task or self._listen_task.done():
                 self._listen_task = asyncio.create_task(self._listen_for_responses())
 
+            await self._wait_for_quiet_period(target_ip)
             await self._send_udp_message(message, target_ip, target_port)
 
             try:
@@ -251,12 +339,44 @@ class MarstekUDPClient:
         finally:
             self._pending_requests.pop(request_id, None)
 
+    async def _wait_for_quiet_period(self, device_ip: str) -> None:
+        """Hold the next request until the device has been quiet long enough.
+
+        Field logs show Marstek devices silently dropping a request that
+        arrives within moments of their previous response, while requests
+        sent after a longer quiet period are answered. When a minimum
+        request gap is configured, wait out the remainder of that gap
+        since the device last responded, so the request lands once the
+        device is back in its receive loop. A device that never answered
+        (or a disabled gap) sends immediately.
+        """
+        if self._min_request_gap <= 0:
+            return
+        last_response = self._last_response_at.get(device_ip)
+        if last_response is None:
+            return
+        remaining = self._min_request_gap - (
+            asyncio.get_running_loop().time() - last_response
+        )
+        if remaining > 0:
+            _LOGGER.debug(
+                "Holding request to %s for %.0f ms (device quiet gap)",
+                device_ip,
+                remaining * 1000,
+            )
+            await asyncio.sleep(remaining)
+
     async def _listen_for_responses(self) -> None:
         """Listen for UDP responses.
 
         Receiving and parsing are split: a single malformed packet (bad
         UTF-8 or invalid JSON) is logged and dropped so it can never kill
         the listener or leave pending requests stuck until their timeout.
+        Every iteration updates a heartbeat the watchdog uses to detect a
+        task that is alive but no longer draining the socket, and a broad
+        exception guard ensures no unexpected packet can take the listener
+        down -- a dead listener means sends keep working while replies are
+        never read, which silently looks like the device never answers.
         """
         if not self._socket:
             return
@@ -268,56 +388,223 @@ class MarstekUDPClient:
             except asyncio.CancelledError:
                 break
             except OSError as err:
+                self._consecutive_recv_errors += 1
+                if self._consecutive_recv_errors >= RECV_ERROR_REBIND_THRESHOLD:
+                    _LOGGER.error(
+                        "UDP recv failed %d times in a row (%s); the socket "
+                        "is bad -- rebounding and restarting listener",
+                        self._consecutive_recv_errors,
+                        err,
+                    )
+                    # Reopen the socket and hand off to a fresh listener
+                    # task, then return (this task exits). We must NOT call
+                    # _rebind_socket here: it cancels and awaits
+                    # self._listen_task, which IS this task -- awaiting it
+                    # would deadlock and the socket would never rebind.
+                    if await self._reopen_socket():
+                        self._listen_task = asyncio.create_task(
+                            self._listen_for_responses()
+                        )
+                    return
                 _LOGGER.error("Error receiving UDP response: %s", err)
                 await asyncio.sleep(1)
                 continue
 
+            self._consecutive_recv_errors = 0
+            self._listener_heartbeat = loop.time()
+            self._listener_ever_received = True
+            # Receiving anything ends a "silent episode": a later stall may
+            # rebound once again.
+            self._stuck_rebound_done = False
+
             try:
-                response_text = data.decode("utf-8")
-                response = json.loads(response_text)
-            except UnicodeDecodeError:
-                _LOGGER.debug(
-                    "Dropping non-UTF-8 UDP packet from %s:%d", addr[0], addr[1]
+                self._handle_response(data, addr)
+            except Exception:
+                _LOGGER.exception(
+                    "Unexpected error processing UDP packet from %s:%d; "
+                    "dropping packet and continuing",
+                    addr[0],
+                    addr[1],
                 )
-                continue
-            except json.JSONDecodeError:
-                response = {"raw": response_text}
 
-            request_id = response.get("id") if isinstance(response, dict) else None
+    def _handle_response(self, data: bytes, addr: tuple[str, int]) -> None:
+        """Parse one received packet and dispatch it to its waiter."""
+        try:
+            response_text = data.decode("utf-8")
+            response = json.loads(response_text)
+        except UnicodeDecodeError:
+            _LOGGER.debug("Dropping non-UTF-8 UDP packet from %s:%d", addr[0], addr[1])
+            return
+        except json.JSONDecodeError:
+            response = {"raw": response_text}
 
-            _LOGGER.debug(
-                "Recv: %s:%d -> %s:%d | %s",
-                addr[0],
-                addr[1],
-                self._local_send_ip,
-                self._port,
-                json.dumps(response, ensure_ascii=False),
-            )
+        request_id = response.get("id") if isinstance(response, dict) else None
 
-            # Only keep responses someone is waiting for; anything else is
-            # dropped so unsolicited or late packets cannot accumulate.
-            if request_id and request_id in self._broadcast_responses:
-                self._broadcast_responses[request_id].append(response)
-            elif request_id and request_id in self._pending_requests:
-                future, expected_source = self._pending_requests[request_id]
-                # A unicast response must come from the device we asked; a
-                # packet from another host with a guessed or observed id is
-                # dropped so it cannot forge a status reply or fake a write
-                # success. The entry is left in place for a legitimate reply.
-                # Source verification can be disabled for loopback tests or
-                # NAT setups that rewrite the source address.
-                if self._verify_source_ip and addr[0] != expected_source:
-                    _LOGGER.warning(
-                        "Dropping unicast response %d from %s:%d: expected %s",
-                        request_id,
-                        addr[0],
-                        addr[1],
-                        expected_source,
-                    )
+        _LOGGER.debug(
+            "Recv: %s:%d -> %s:%d | %s",
+            addr[0],
+            addr[1],
+            self._local_send_ip,
+            self._port,
+            json.dumps(response, ensure_ascii=False),
+        )
+        # Any packet from a host marks it as recently talking; the
+        # quiet-gap logic spaces the next request to it accordingly.
+        self._last_response_at[addr[0]] = asyncio.get_running_loop().time()
+
+        # Only keep responses someone is waiting for; anything else is
+        # dropped so unsolicited or late packets cannot accumulate.
+        if request_id and request_id in self._broadcast_responses:
+            self._broadcast_responses[request_id].append(response)
+        elif request_id and request_id in self._pending_requests:
+            future, expected_source = self._pending_requests[request_id]
+            # A unicast response must come from the device we asked; a
+            # packet from another host with a guessed or observed id is
+            # dropped so it cannot forge a status reply or fake a write
+            # success. The entry is left in place for a legitimate reply.
+            # Source verification can be disabled for loopback tests or
+            # NAT setups that rewrite the source address.
+            if self._verify_source_ip and addr[0] != expected_source:
+                _LOGGER.warning(
+                    "Dropping unicast response %d from %s:%d: expected %s",
+                    request_id,
+                    addr[0],
+                    addr[1],
+                    expected_source,
+                )
+                return
+            self._pending_requests.pop(request_id)
+            if not future.done():
+                future.set_result(response)
+
+    def _ensure_watchdog(self) -> None:
+        """Start the listener watchdog if it is not running.
+
+        Called from ``async_setup`` and from the send path so the watchdog
+        exists for the whole lifetime the client is active.
+        """
+        if self._watchdog_task is None or self._watchdog_task.done():
+            self._watchdog_task = asyncio.create_task(self._listener_watchdog())
+
+    async def _listener_watchdog(self) -> None:
+        """Keep the receive task alive and recover if it stalls.
+
+        A dead or stuck listener leaves ``sendto`` working but replies
+        unread -- the OS receive buffer fills and drops them -- which is
+        silently indistinguishable from a device that never answers. The
+        watchdog:
+
+        * restarts a listener task that has exited (logging any exception
+          it died with), and
+        * if the task is alive but has not read a packet for a while AND it
+          had read one earlier this session, treats it as stuck and
+          rebounds the socket (cancels the task, closes/reopens the socket,
+          starts a fresh listener).
+
+        A listener that has never read a packet is left alone: that is the
+        normal state while reachable devices are simply silent, and
+        rebounding would only churn during legitimate device downtime.
+        Stuck-rebound fires at most once per silent episode (a packet resets
+        it) so an offline device does not rebind on every tick.
+        """
+        loop = asyncio.get_running_loop()
+        while True:
+            await asyncio.sleep(LISTENER_WATCHDOG_INTERVAL)
+            try:
+                if self._listen_task is None or self._listen_task.done():
+                    if (
+                        self._listen_task is not None
+                        and not self._listen_task.cancelled()
+                        and self._listen_task.exception() is not None
+                    ):
+                        _LOGGER.error(
+                            "UDP listener task crashed: %r; restarting it",
+                            self._listen_task.exception(),
+                        )
+                    else:
+                        _LOGGER.warning(
+                            "UDP listener task was not running; restarting it"
+                        )
+                    if self._socket is not None:
+                        self._listen_task = asyncio.create_task(
+                            self._listen_for_responses()
+                        )
+                        self._listener_heartbeat = loop.time()
                     continue
-                self._pending_requests.pop(request_id)
-                if not future.done():
-                    future.set_result(response)
+
+                if self._listener_ever_received:
+                    silence = loop.time() - self._listener_heartbeat
+                    if silence > LISTENER_STUCK_SILENCE:
+                        if not self._stuck_rebound_done:
+                            self._stuck_rebound_done = True
+                            _LOGGER.error(
+                                "UDP listener appears stuck: no packets read "
+                                "for %.0fs despite prior traffic; rebounding "
+                                "socket and restarting listener",
+                                silence,
+                            )
+                            await self._rebind_socket()
+                        else:
+                            _LOGGER.debug(
+                                "UDP listener still silent (%.0fs); already "
+                                "rebound this episode, waiting for traffic",
+                                silence,
+                            )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                _LOGGER.exception("UDP listener watchdog error; continuing")
+
+    async def _reopen_socket(self) -> bool:
+        """Close and reopen the UDP socket without touching the listener task.
+
+        Used by the listener itself when its socket goes bad: the listener
+        cannot call ``_rebind_socket`` (that cancels and awaits
+        ``self._listen_task``, i.e. this task, deadlocking), so it reopens
+        the socket here, spawns a fresh listener, and returns -- the old
+        listener task simply exits. Returns True if a new socket is bound.
+        """
+        if self._socket:
+            self._socket.close()
+        self._socket = None
+        try:
+            await self.async_setup()
+        except OSError as err:
+            _LOGGER.error("Failed to rebind UDP socket: %s", err)
+            self._socket = None
+            return False
+        return self._socket is not None
+
+    async def _rebind_socket(self) -> None:
+        """Close and reopen the socket and restart the listener.
+
+        Used by the watchdog (stuck listener) and the public restart hook,
+        both of which run OUTSIDE the listener task, so cancelling and
+        awaiting ``self._listen_task`` here is safe. The listener itself
+        uses ``_reopen_socket`` instead to avoid awaiting itself.
+
+        The old listen task is cancelled and the socket closed before the
+        new bind so the exclusive bind (0.0.0.0:<local_port>, default
+        30000) is free again.
+        """
+        if self._listen_task and not self._listen_task.done():
+            self._listen_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self._listen_task
+        self._listen_task = None
+
+        if await self._reopen_socket():
+            self._listen_task = asyncio.create_task(self._listen_for_responses())
+
+    async def async_restart_listener(self) -> None:
+        """Force-restart the listener and rebound the socket.
+
+        Public recovery hook for callers (e.g. a Home Assistant service or
+        the coordinator) that observe sustained "device silent" behavior and
+        want to reset the client's receive path without a full reload.
+        """
+        _LOGGER.info("Restarting Marstek UDP listener (manual request)")
+        await self._rebind_socket()
 
     async def send_broadcast_request(
         self,
@@ -497,6 +784,10 @@ class MarstekUDPClient:
         await self.pause_polling(target_ip)
         try:
             async with self._device_status_lock(target_ip):
+                # Let the device recover from the response the in-flight
+                # poll just sent; a request fired within milliseconds of
+                # the previous one is dropped by some Marstek devices.
+                await asyncio.sleep(WRITE_SETTLE_MS / 1000.0)
                 return await self.send_request(
                     message,
                     target_ip,
@@ -737,7 +1028,19 @@ class MarstekUDPClient:
 
         async def extras_request() -> None:
             nonlocal result_data, answered
+            # The extras queries are spaced like the core requests: a
+            # request fired moments after the device's previous response
+            # is silently dropped by some Marstek devices.
+            queried = False
+
+            async def spacing() -> None:
+                nonlocal queried
+                if queried:
+                    await delay(delay_ms)
+                queried = True
+
             if self._is_method_supported(device_ip, CMD_WIFI_STATUS):
+                await spacing()
                 result = await self._async_query_component(
                     get_wifi_status(0),
                     device_ip,
@@ -749,6 +1052,7 @@ class MarstekUDPClient:
                     answered = True
                     result_data = result_data.with_wifi_status_response(result)
             if self._is_method_supported(device_ip, CMD_BLE_STATUS):
+                await spacing()
                 result = await self._async_query_component(
                     get_ble_status(0),
                     device_ip,
@@ -760,6 +1064,7 @@ class MarstekUDPClient:
                     answered = True
                     result_data = result_data.with_ble_status_response(result)
             if self._is_method_supported(device_ip, CMD_EM_STATUS):
+                await spacing()
                 result = await self._async_query_component(
                     get_em_status(0),
                     device_ip,
@@ -772,7 +1077,9 @@ class MarstekUDPClient:
                     result_data = result_data.with_em_status_response(result)
 
         await es_status_request()
+        await delay(delay_ms)
         await es_mode_request()
+        await delay(delay_ms)
         await battery_status_request()
         if include_pv and self._pv_status_supported.get(device_ip) is not False:
             await delay(delay_ms)
@@ -847,22 +1154,109 @@ class MarstekUDPClient:
         *,
         port: int | None = None,
         timeout: float = 5.0,
+        max_retries: int = WRITE_MAX_RETRIES,
     ) -> None:
-        """Send a configuration command and verify its set_result."""
-        try:
-            response = await self.send_request_with_polling_control(
-                message, device_ip, target_port=port, timeout=timeout
-            )
-        except (TimeoutError, OSError) as err:
-            raise MarstekSetError(
-                device_ip, method, "the device did not respond"
-            ) from err
+        """Send a configuration command and verify its ``set_result``.
 
-        result = response.get("result")
-        if not isinstance(result, dict):
-            raise MarstekSetError(device_ip, method, "the device returned no result")
-        if result.get("set_result") not in TRUTHY_SET_RESULTS:
-            raise MarstekSetError(device_ip, method, "the device rejected the command")
+        Rapid successive writes of the *same setting* to the same device are
+        coalesced: a write that is still queued behind an executing one when
+        a newer write for that same setting arrives is skipped, so toggling a
+        control back and forth does not fire every intermediate value. Writes
+        of *different* settings (e.g. LED queued behind an in-flight DOD, or a
+        DOD arriving while LED runs) are never superseded -- they do not
+        replace each other, so both must be sent. The first write runs
+        immediately and the latest of a given setting runs last; only same
+        -setting writes that lost the race in between are dropped. A write
+        that has already started sending is never aborted (a UDP datagram
+        cannot be unsent), so the device may still see the first of a burst.
+
+        Each write that does run is retried ``max_retries`` times
+        (``WRITE_MAX_RETRIES`` by default) when the device stays silent; a
+        malformed or rejected response is not retried because the device
+        answered. Callers pass ``max_retries=0`` for commands that are not
+        safe to repeat -- resending an already-executed one is worse than
+        reporting a timeout.
+        """
+        generation = self._bump_write_generation(device_ip, method)
+        async with self._write_lock(device_ip):
+            if self._write_generation.get((device_ip, method), 0) != generation:
+                _LOGGER.debug(
+                    "Skipping superseded %s write to %s (a newer %s write "
+                    "took its place)",
+                    method,
+                    device_ip,
+                    method,
+                )
+                return
+            await self._execute_set_command(
+                message,
+                device_ip,
+                method,
+                port=port,
+                timeout=timeout,
+                max_retries=max_retries,
+            )
+
+    def _write_lock(self, device_ip: str) -> asyncio.Lock:
+        """Return the per-device lock that serializes and coalesces writes."""
+        lock = self._write_locks.get(device_ip)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._write_locks[device_ip] = lock
+        return lock
+
+    def _bump_write_generation(self, device_ip: str, method: str) -> int:
+        """Advance the per-(device, setting) write generation; return it new."""
+        key = (device_ip, method)
+        generation = self._write_generation.get(key, 0) + 1
+        self._write_generation[key] = generation
+        return generation
+
+    async def _execute_set_command(
+        self,
+        message: str,
+        device_ip: str,
+        method: str,
+        *,
+        port: int | None = None,
+        timeout: float = 5.0,
+        max_retries: int = WRITE_MAX_RETRIES,
+    ) -> None:
+        """Run the send, retry and verify loop for a single write.
+
+        Only a silent device (timeout/OSError) is retried, up to
+        ``max_retries`` times. A response -- including a rejection -- ends the
+        loop, because the device did answer.
+        """
+        for attempt in range(max_retries + 1):
+            try:
+                response = await self.send_request_with_polling_control(
+                    message, device_ip, target_port=port, timeout=timeout
+                )
+            except (TimeoutError, OSError) as err:
+                if attempt < max_retries:
+                    _LOGGER.info(
+                        "Retrying %s to %s after no response (attempt %d/%d)",
+                        method,
+                        device_ip,
+                        attempt + 2,
+                        max_retries + 1,
+                    )
+                    continue
+                raise MarstekSetError(
+                    device_ip, method, "the device did not respond"
+                ) from err
+
+            result = response.get("result")
+            if not isinstance(result, dict):
+                raise MarstekSetError(
+                    device_ip, method, "the device returned no result"
+                )
+            if result.get("set_result") not in TRUTHY_SET_RESULTS:
+                raise MarstekSetError(
+                    device_ip, method, "the device rejected the command"
+                )
+            return
 
     async def set_device_mode(
         self,
@@ -872,10 +1266,94 @@ class MarstekUDPClient:
         port: int | None = None,
         timeout: float = 5.0,
     ) -> None:
-        """Set the device operating mode via ES.SetMode."""
+        """Set the device operating mode via ES.SetMode.
+
+        Manual mode is special-cased: the Open API documents
+        ``manual_cfg`` as a single slot object (identified by
+        ``time_num``), so a schedule of N slots is sent as N SetMode
+        calls, one per slot, not as one array-valued call.
+        """
+        if config.mode == MODE_MANUAL and config.manual_slots:
+            await self._async_set_manual_schedule(
+                config.manual_slots, device_ip=device_ip, port=port, timeout=timeout
+            )
+            return
         await self._async_send_set_command(
             set_es_mode(config), device_ip, CMD_ES_SET_MODE, port=port, timeout=timeout
         )
+
+    async def set_manual_schedule(
+        self,
+        device_ip: str,
+        slots: Iterable[MarstekManualSlot],
+        *,
+        port: int | None = None,
+        timeout: float = 5.0,
+    ) -> None:
+        """Update the device's Manual-mode time slots.
+
+        Each slot is sent as its own ES.SetMode with a single-object
+        ``manual_cfg`` (the documented form), so N slots result in N
+        SetMode calls. The caller assigns ``time_num`` (0-9); slots keep
+        their own weekday bitmask, time range, power and charge mode.
+
+        Note: this only writes/updates the slots passed in. It does NOT
+        clear slots that already exist on the device but were not provided
+        here -- if the firmware updates slots individually by ``time_num``,
+        previously-programmed slots outside this set remain in effect. A
+        true "replace whole schedule" would require writing empty/disable
+        slots for every un-provided ``time_num`` once the device's slot
+        semantics are confirmed.
+        """
+        await self._async_set_manual_schedule(
+            slots, device_ip=device_ip, port=port, timeout=timeout
+        )
+
+    async def _async_set_manual_schedule(
+        self,
+        slots: Iterable[MarstekManualSlot],
+        *,
+        device_ip: str,
+        port: int | None = None,
+        timeout: float = 5.0,
+    ) -> None:
+        """Send all Manual slots under one write lock as an atomic batch.
+
+        Holding the per-device write lock for the whole schedule means no
+        other write (a mode change to AI, a DOD set, ...) can interleave
+        between two slots -- otherwise a mode command landing mid-schedule
+        could flip the device out of Manual while later slots still apply the
+        old schedule. Each slot is still its own single-object ES.SetMode
+        (the documented form). A newer ES.SetMode write that arrived while
+        this batch was queued supersedes it (latest-wins), same as a single
+        write.
+        """
+        slot_list = list(slots)
+        if not slot_list:
+            raise ValueError("manual schedule requires at least one slot")
+        generation = self._bump_write_generation(device_ip, CMD_ES_SET_MODE)
+        async with self._write_lock(device_ip):
+            if (
+                self._write_generation.get((device_ip, CMD_ES_SET_MODE), 0)
+                != generation
+            ):
+                _LOGGER.debug(
+                    "Skipping superseded manual schedule to %s "
+                    "(a newer ES.SetMode write took its place)",
+                    device_ip,
+                )
+                return
+            for slot in slot_list:
+                _LOGGER.debug(
+                    "Setting manual slot time_num=%s on %s", slot.time_num, device_ip
+                )
+                await self._execute_set_command(
+                    set_es_mode_slot(slot),
+                    device_ip,
+                    CMD_ES_SET_MODE,
+                    port=port,
+                    timeout=timeout,
+                )
 
     async def set_dod(
         self,
@@ -937,6 +1415,7 @@ class MarstekUDPClient:
         keep_accumulated_data: bool = False,
         port: int | None = None,
         timeout: float = 5.0,
+        retry_on_timeout: bool = False,
     ) -> None:
         """Reset the device to factory settings via Reset.Factory.
 
@@ -946,6 +1425,13 @@ class MarstekUDPClient:
            lifetime energy counters and other accumulated data, not only the
            configuration. Pass ``keep_accumulated_data=True`` to preserve
            them. This is a destructive, high-consequence operation.
+
+        Unlike the other writes, a silent device is **not** retried by
+        default: a reset that already ran can drop its reply (the device
+        reboots), and resending would reset a second time. A timeout here
+        therefore means "outcome unknown -- check the device", not "not
+        done". Pass ``retry_on_timeout=True`` to get the generic retry
+        behaviour, accepting the risk of a duplicate reset.
         """
         await self._async_send_set_command(
             factory_reset_command(keep_accumulated_data),
@@ -953,6 +1439,7 @@ class MarstekUDPClient:
             "Reset.Factory",
             port=port,
             timeout=timeout,
+            max_retries=WRITE_MAX_RETRIES if retry_on_timeout else 0,
         )
 
     async def get_device_info(
