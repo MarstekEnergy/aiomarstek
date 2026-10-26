@@ -150,7 +150,11 @@ class MarstekUDPClient:
         self._discovery_cache: list[MarstekDeviceInfo] | None = None
         self._cache_timestamp: float = 0
         self._cache_duration: float = 30.0
-        self._local_send_ip: str = "0.0.0.0"
+        # Bound address of the client socket, for logging only. This is the
+        # address passed to bind() (0.0.0.0 = all interfaces), NOT the actual
+        # outgoing interface: getsockname() on a 0.0.0.0 bind also returns
+        # 0.0.0.0, so it is not a usable "source IP" for diagnostics.
+        self._local_bind_ip: str = "0.0.0.0"
         self._polling_pause_count: dict[str, int] = {}
         self._status_locks: dict[str, asyncio.Lock] = {}
         self._polling_lock: asyncio.Lock = asyncio.Lock()
@@ -278,7 +282,7 @@ class MarstekUDPClient:
                 "Send: %s:%d <- %s:%d | %s",
                 target_ip,
                 target_port or self._port,
-                self._local_send_ip,
+                self._local_bind_ip,
                 self._local_port,
                 message,
             )
@@ -444,7 +448,7 @@ class MarstekUDPClient:
             "Recv: %s:%d -> %s:%d | %s",
             addr[0],
             addr[1],
-            self._local_send_ip,
+            self._local_bind_ip,
             self._port,
             json.dumps(response, ensure_ascii=False),
         )

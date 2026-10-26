@@ -361,18 +361,18 @@ async def test_set_power_version_validates_value() -> None:
         await client.set_power_version("192.168.1.10", 1000)
 
 
-async def test_set_ble_adv_inverts_enable(
+async def test_set_ble_adv_maps_lock_enable(
     recording_client: tuple[MarstekUDPClient, list[dict[str, Any]]],
 ) -> None:
-    """Ble.Adv sends enable=0 to turn advertising on."""
+    """Ble.Adv sends enable=1 to turn advertising on (lock disabled)."""
     client, sent = recording_client
 
     await client.set_bluetooth_advertising("192.168.1.10", True)
     await client.set_bluetooth_advertising("192.168.1.10", False)
 
     assert sent[0]["method"] == "Ble.Adv"
-    assert sent[0]["params"] == {"id": 0, "enable": 0}
-    assert sent[1]["params"] == {"id": 0, "enable": 1}
+    assert sent[0]["params"] == {"id": 0, "enable": 1}
+    assert sent[1]["params"] == {"id": 0, "enable": 0}
 
 
 async def test_set_led_maps_state(
