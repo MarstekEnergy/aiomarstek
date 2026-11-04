@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from aiomarstek import (
     MODE_MANUAL,
     MarstekManualSlot,
@@ -13,10 +15,14 @@ from aiomarstek import (
 from aiomarstek.const import (
     CMD_BATTERY_STATUS,
     CMD_DISCOVER,
+    CMD_ENERGY_DATA,
+    CMD_ERR_GET,
     CMD_ES_MODE,
     CMD_ES_SET_MODE,
     CMD_ES_STATUS,
     CMD_PV_GET_STATUS,
+    CMD_SYS_INFO,
+    CMD_SYS_REBOOT,
 )
 
 
@@ -86,6 +92,51 @@ def test_get_pv_status() -> None:
     command = _parse(command_builder.get_pv_status(2))
     assert command["method"] == CMD_PV_GET_STATUS
     assert command["params"] == {"id": 2}
+
+
+def test_get_sys_info() -> None:
+    """Sys.GetInfo reads the device's system settings (DOD, BLE, LED)."""
+    command_builder.reset_request_id()
+    command = _parse(command_builder.get_sys_info(4))
+    assert command["method"] == CMD_SYS_INFO
+    assert command["params"] == {"id": 4}
+
+
+def test_get_errors() -> None:
+    """Err.Get queries the device's error codes."""
+    command_builder.reset_request_id()
+    command = _parse(command_builder.get_errors())
+    assert command["method"] == CMD_ERR_GET
+    assert command["params"] == {"id": 0}
+
+
+def test_get_energy_data() -> None:
+    """Energy.GetData queries the day/month/total charge and discharge."""
+    command_builder.reset_request_id()
+    command = _parse(command_builder.get_energy_data())
+    assert command["method"] == CMD_ENERGY_DATA
+    assert command["params"] == {"id": 0}
+
+
+def test_reboot_defaults_to_ems() -> None:
+    """Sys.Reboot defaults to type 1 (EMS), the device restart."""
+    command_builder.reset_request_id()
+    command = _parse(command_builder.reboot())
+    assert command["method"] == CMD_SYS_REBOOT
+    assert command["params"] == {"id": 0, "type": 1}
+
+
+def test_reboot_targets() -> None:
+    """Each documented target maps to its Sys.Reboot type."""
+    command_builder.reset_request_id()
+    assert _parse(command_builder.reboot("inv"))["params"]["type"] == 2
+    assert _parse(command_builder.reboot("bms"))["params"]["type"] == 3
+
+
+def test_reboot_rejects_unknown_target() -> None:
+    """An undocumented target fails before anything is sent."""
+    with pytest.raises(ValueError, match="reboot target"):
+        command_builder.reboot("battery")
 
 
 def test_reset_request_id() -> None:

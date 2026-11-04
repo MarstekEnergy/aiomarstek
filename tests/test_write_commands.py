@@ -641,3 +641,83 @@ async def test_write_does_not_drop_different_setting(
     # Order follows the write lock's FIFO: DOD (running) -> LED (queued
     # first) -> DOD (queued second).
     assert calls == ["DOD.SET", "Led.Ctrl", "DOD.SET"]
+
+
+async def test_reboot_sends_sys_reboot_for_ems(
+    recording_client: tuple[MarstekUDPClient, list[dict[str, Any]]],
+) -> None:
+    """reboot() sends Sys.Reboot with the EMS type by default."""
+    client, sent = recording_client
+
+    await client.reboot("192.168.1.10")
+
+    assert [s["method"] for s in sent] == ["Sys.Reboot"]
+    assert sent[0]["params"] == {"id": 0, "type": 1}
+
+
+async def test_reboot_tolerates_a_dropped_reply(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A restarting device often drops its reply; that is not an error."""
+    client = MarstekUDPClient()
+
+    async def silent_send(message: str, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        raise TimeoutError("Request timeout")
+
+    monkeypatch.setattr(client, "send_request_with_polling_control", silent_send)
+
+    # Must not raise: the command cannot be verified, but it was sent once.
+    await client.reboot("192.168.1.10", target="bms")
+
+
+async def test_reboot_propagates_send_failures(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed send must not look like a restart in progress.
+
+    Only a missing reply is tolerated. An ``OSError`` from the socket (network
+    unreachable, bind failure, ...) means the datagram may never have left, so
+    it has to reach the caller instead of returning as if the restart ran.
+    """
+    client = MarstekUDPClient()
+
+    async def unreachable_send(
+        message: str, *args: Any, **kwargs: Any
+    ) -> dict[str, Any]:
+        raise OSError("Network is unreachable")
+
+    monkeypatch.setattr(client, "send_request_with_polling_control", unreachable_send)
+
+    with pytest.raises(OSError, match="Network is unreachable"):
+        await client.reboot("192.168.1.10")
+
+
+async def test_reboot_propagates_socket_setup_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A socket that cannot be created fails the restart instead of faking it."""
+    monkeypatch.setattr("aiomarstek.udp_client.WRITE_SETTLE_MS", 0)
+
+    def failing_factory(*args: Any, **kwargs: Any) -> Any:
+        raise OSError("EADDRINUSE")
+
+    monkeypatch.setattr("aiomarstek.udp_client._SOCKET_FACTORY", failing_factory)
+    client = MarstekUDPClient()
+
+    with pytest.raises(OSError, match="EADDRINUSE"):
+        await client.reboot("192.168.1.10")
+
+
+async def test_reboot_raises_when_the_device_rejects_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A reply with set_result false surfaces as a set error."""
+    client = MarstekUDPClient()
+
+    async def rejecting_send(message: str, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        return {"id": 1, "src": "Venus-mac", "result": {"id": 0, "set_result": False}}
+
+    monkeypatch.setattr(client, "send_request_with_polling_control", rejecting_send)
+
+    with pytest.raises(MarstekSetError):
+        await client.reboot("192.168.1.10")

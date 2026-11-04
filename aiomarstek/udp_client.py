@@ -6,18 +6,21 @@ import asyncio
 import json
 import logging
 import socket
-from collections.abc import Iterable
+from collections.abc import Collection, Iterable, Mapping
 from contextlib import suppress
-from typing import Any
+from typing import Any, Final
 
 from .command_builder import (
     discover,
     get_battery_status,
     get_ble_status,
     get_em_status,
+    get_energy_data,
+    get_errors,
     get_es_mode,
     get_es_status,
     get_pv_status,
+    get_sys_info,
     get_wifi_status,
     set_ble_adv,
     set_dod,
@@ -29,14 +32,21 @@ from .command_builder import (
 from .command_builder import (
     factory_reset as factory_reset_command,
 )
+from .command_builder import (
+    reboot as reboot_command,
+)
 from .const import (
     CMD_BATTERY_STATUS,
     CMD_BLE_STATUS,
     CMD_EM_STATUS,
+    CMD_ENERGY_DATA,
+    CMD_ERR_GET,
     CMD_ES_MODE,
     CMD_ES_SET_MODE,
     CMD_ES_STATUS,
     CMD_PV_GET_STATUS,
+    CMD_SYS_INFO,
+    CMD_SYS_REBOOT,
     CMD_WIFI_STATUS,
     DEFAULT_UDP_PORT,
     DISCOVERY_TIMEOUT,
@@ -63,6 +73,40 @@ from .models import (
 
 _LOGGER = logging.getLogger(__name__)
 _SOCKET_FACTORY = socket.socket
+
+# Which monotonic counters a component reports, and the reply field carrying
+# each one. Only a counter whose component answered *and* whose field is
+# present in that reply is a fresh reading for the poll; everything else is a
+# value carried over from the previous status. The distinction matters to the
+# drop streak (see _smooth_status): a carried value must not count as a new
+# reading, or a slow group polled every EXTRAS_INTERVAL calls would keep
+# resetting the streak the fast polls leave alone.
+MONOTONIC_FRESH_FIELDS: Final = {
+    CMD_ES_STATUS: {
+        "total_pv_energy": "total_pv_energy",
+        "total_grid_output_energy": "total_grid_output_energy",
+        "total_grid_input_energy": "total_grid_input_energy",
+        "total_load_energy": "total_load_energy",
+    },
+    CMD_ES_MODE: {
+        "ct_input_energy": "input_energy",
+        "ct_output_energy": "output_energy",
+    },
+    CMD_BATTERY_STATUS: {
+        "battery_total_input_energy": "bat_total_input_energy",
+        "battery_total_output_energy": "bat_total_output_energy",
+        "backup_input_energy": "backup_input_energy",
+        "backup_output_energy": "backup_output_energy",
+    },
+    CMD_ENERGY_DATA: {
+        "energy_total_charge": "total_charge",
+        "energy_total_discharge": "total_discharge",
+    },
+    CMD_EM_STATUS: {
+        "ct_input_energy": "input_energy",
+        "ct_output_energy": "output_energy",
+    },
+}
 
 
 class MarstekNoResponse(Exception):
@@ -480,6 +524,38 @@ class MarstekUDPClient:
             self._pending_requests.pop(request_id)
             if not future.done():
                 future.set_result(response)
+        elif (
+            request_id == 0
+            and isinstance(response, dict)
+            and isinstance(response.get("error"), dict)
+        ):
+            # Some Marstek firmwares answer a request they could not parse
+            # with a JSON-RPC error whose id is 0 (e.g. -32700 Parse error,
+            # data 403), regardless of the request's real id. Since request
+            # ids start at 1, id 0 matches no pending waiter and the error
+            # is otherwise dropped -- the original request then blocks for a
+            # full timeout window while the device already answered, which
+            # stacks needless retries onto a device that may already be
+            # struggling and lengthens every poll that hits a 403. Polling
+            # is serial per device (quiet gap + sequential awaits), so at
+            # most one request is outstanding for this source: deliver the
+            # error to that single waiter so it resolves immediately and the
+            # caller can fall back to the next id without waiting out the
+            # timeout. With multiple outstanding requests (multi-device) the
+            # error cannot be attributed safely, so it is still dropped.
+            if self._verify_source_ip:
+                candidates = [
+                    rid
+                    for rid, (_fut, src) in self._pending_requests.items()
+                    if src == addr[0]
+                ]
+            else:
+                candidates = list(self._pending_requests)
+            if len(candidates) == 1:
+                rid = candidates[0]
+                future, _src = self._pending_requests.pop(rid)
+                if not future.done():
+                    future.set_result(response)
 
     def _ensure_watchdog(self) -> None:
         """Start the listener watchdog if it is not running.
@@ -865,6 +941,7 @@ class MarstekUDPClient:
         include_pv: bool = True,
         include_battery: bool = True,
         include_extras: bool = True,
+        force_extras: bool = False,
     ) -> MarstekDeviceStatus:
         """Fetch device status and component data.
 
@@ -892,6 +969,7 @@ class MarstekUDPClient:
                 include_pv=include_pv,
                 include_battery=include_battery,
                 include_extras=include_extras,
+                force_extras=force_extras,
             )
 
     def _device_status_lock(self, device_ip: str) -> asyncio.Lock:
@@ -913,6 +991,7 @@ class MarstekUDPClient:
         include_pv: bool = True,
         include_battery: bool = True,
         include_extras: bool = True,
+        force_extras: bool = False,
     ) -> MarstekDeviceStatus:
         """Fetch device status and component data.
 
@@ -924,7 +1003,12 @@ class MarstekUDPClient:
 
         Queries ES.GetStatus, ES.GetMode and Bat.GetStatus on every call,
         PV.GetStatus for devices with DC PV inputs, and the slow-changing
-        WiFi, BLE and EM components every ``EXTRAS_INTERVAL`` calls.
+        WiFi, BLE, EM, energy, system-info and error components every
+        ``EXTRAS_INTERVAL`` calls. ``force_extras`` runs that slow-changing
+        group on this call regardless of the counter (the readback for the
+        controls follows from ``Sys.GetInfo``, so the caller forces it after a
+        write), and resets the counter so the next regular extras cycle stays a
+        full interval away.
 
         Raises MarstekNoResponse when the device does not answer any of the
         status requests; the caller then keeps the previous data.
@@ -935,6 +1019,16 @@ class MarstekUDPClient:
             else self._last_status.get(device_ip)
         ) or MarstekDeviceStatus(device_ip=device_ip)
         answered = False
+        # Monotonic counters that arrived in a reply during this poll, as
+        # opposed to values carried over from ``result_data``'s baseline.
+        fresh_counters: set[str] = set()
+
+        def mark_fresh(method: str, response: Mapping[str, object]) -> None:
+            """Record the monotonic counters this reply reported."""
+            for key, field in MONOTONIC_FRESH_FIELDS.get(method, {}).items():
+                if field in response:
+                    fresh_counters.add(key)
+
         # The recorded results double as a freshness snapshot: each poll
         # starts from scratch, so afterwards they hold exactly the methods
         # that answered this poll. A fully silent poll restores the previous
@@ -962,6 +1056,7 @@ class MarstekUDPClient:
                 return
             self._record_response(device_ip, CMD_ES_STATUS, status_data)
             answered = True
+            mark_fresh(CMD_ES_STATUS, status_data)
             result_data = result_data.with_es_status_response(status_data)
 
         async def es_mode_request() -> None:
@@ -985,6 +1080,7 @@ class MarstekUDPClient:
                 self._es_mode_device_ids[device_ip] = device_id
                 self._record_response(device_ip, CMD_ES_MODE, mode_data)
                 answered = True
+                mark_fresh(CMD_ES_MODE, mode_data)
                 result_data = result_data.with_es_mode_response(mode_data)
                 return
 
@@ -1004,6 +1100,7 @@ class MarstekUDPClient:
             if result is None:
                 return
             answered = True
+            mark_fresh(CMD_BATTERY_STATUS, result)
             result_data = result_data.with_battery_status_response(result)
 
         async def pv_status_request() -> None:
@@ -1078,7 +1175,45 @@ class MarstekUDPClient:
                 )
                 if result is not None:
                     answered = True
+                    mark_fresh(CMD_EM_STATUS, result)
                     result_data = result_data.with_em_status_response(result)
+            if self._is_method_supported(device_ip, CMD_ENERGY_DATA):
+                await spacing()
+                result = await self._async_query_component(
+                    get_energy_data(0),
+                    device_ip,
+                    CMD_ENERGY_DATA,
+                    port=port,
+                    timeout=timeout,
+                )
+                if result is not None:
+                    answered = True
+                    mark_fresh(CMD_ENERGY_DATA, result)
+                    result_data = result_data.with_energy_response(result)
+            if self._is_method_supported(device_ip, CMD_SYS_INFO):
+                await spacing()
+                result = await self._async_query_component(
+                    get_sys_info(0),
+                    device_ip,
+                    CMD_SYS_INFO,
+                    port=port,
+                    timeout=timeout,
+                )
+                if result is not None:
+                    answered = True
+                    result_data = result_data.with_sys_info_response(result)
+            if self._is_method_supported(device_ip, CMD_ERR_GET):
+                await spacing()
+                result = await self._async_query_component(
+                    get_errors(0),
+                    device_ip,
+                    CMD_ERR_GET,
+                    port=port,
+                    timeout=timeout,
+                )
+                if result is not None:
+                    answered = True
+                    result_data = result_data.with_error_response(result)
 
         await es_status_request()
         await delay(delay_ms)
@@ -1088,20 +1223,31 @@ class MarstekUDPClient:
         if include_pv and self._pv_status_supported.get(device_ip) is not False:
             await delay(delay_ms)
             await pv_status_request()
-        if include_extras and self._extras_due(device_ip):
+        extras_due = include_extras and self._extras_due(device_ip)
+        if force_extras:
+            # The caller (a write just succeeded) wants the slow-changing
+            # group refreshed now, without waiting for the next
+            # EXTRAS_INTERVAL boundary. Reset the counter so the following
+            # regular extras cycle is still a full interval away.
+            extras_due = include_extras
+            self._extras_age[device_ip] = 0
+        if extras_due:
             await delay(delay_ms)
             await extras_request()
 
         if not answered:
             self._last_results[device_ip] = snapshot
             raise MarstekNoResponse(device_ip)
-        return self._smooth_status(device_ip, previous_data, result_data)
+        return self._smooth_status(
+            device_ip, previous_data, result_data, fresh_counters
+        )
 
     def _smooth_status(
         self,
         device_ip: str,
         previous_data: MarstekDeviceStatus | None,
         current: MarstekDeviceStatus,
+        refreshed: Collection[str],
     ) -> MarstekDeviceStatus:
         """Apply glitch protection and update per-device streak counters.
 
@@ -1112,6 +1258,13 @@ class MarstekUDPClient:
         stay available via ``get_last_results`` for diagnostics; only the
         returned status is smoothed. A failed poll raises before reaching
         here, so a streak survives an unanswered poll unchanged.
+
+        ``refreshed`` names the monotonic counters this poll actually read.
+        Counters queried by a slower group (the extras cycle) keep their
+        previous value in ``current`` on every other poll; treating that
+        carried value as a new reading would clear the streak each time, so
+        a real reset could never reach the acceptance threshold. Streaks for
+        counters missing from this poll are therefore left untouched.
         """
         previous = (
             previous_data
@@ -1127,8 +1280,9 @@ class MarstekUDPClient:
         smoothed = hold_glitches(previous, current, zero_soc, falling)
 
         # Update streak counters from the raw current reading against the
-        # previous one. A missing value leaves its streak untouched; a
-        # recovered or stable reading clears it.
+        # previous one. A counter that was not read this poll, or whose
+        # reply omitted it, leaves its streak untouched; a recovered or
+        # stable reading clears it.
         if current.battery_soc == 0:
             self._zero_soc_polls[device_ip] = zero_soc + 1
         elif current.battery_soc is not None:
@@ -1136,6 +1290,8 @@ class MarstekUDPClient:
 
         per_key = self._falling_energy_polls.setdefault(device_ip, {})
         for key in MONOTONIC_KEYS:
+            if key not in refreshed:
+                continue  # carried over from the previous status, not a reading
             old = getattr(previous, key)
             new = getattr(current, key)
             if new is None:
@@ -1445,6 +1601,54 @@ class MarstekUDPClient:
             timeout=timeout,
             max_retries=WRITE_MAX_RETRIES if retry_on_timeout else 0,
         )
+
+    async def reboot(
+        self,
+        device_ip: str,
+        *,
+        target: str = "ems",
+        port: int | None = None,
+        timeout: float = 5.0,
+    ) -> None:
+        """Restart a device subsystem via Sys.Reboot.
+
+        ``target`` is one of ``ems`` (the controller the local API talks to,
+        i.e. the device restart users expect), ``inv`` or ``bms``.
+
+        A subsystem that is going down often drops its reply, so a silent
+        device is treated as "restart sent" rather than an error: the command
+        cannot be verified either way, and reporting a failure would make a
+        successful restart look broken. Only a missing *reply* is tolerated:
+        a socket or send failure raises out of ``send_request`` as
+        ``OSError`` (network unreachable, bind failure, ...) and means the
+        datagram may never have left, so that must not be reported as a
+        restart in progress. A reply that rejects the command still raises,
+        and the command is never retried (resending a restart is not safe to
+        do blindly).
+        """
+        message = reboot_command(target)
+        async with self._write_lock(device_ip):
+            try:
+                response = await self.send_request_with_polling_control(
+                    message, device_ip, target_port=port, timeout=timeout
+                )
+            except TimeoutError as err:
+                _LOGGER.info(
+                    "No reply to %s on %s (%s); assuming the restart is running",
+                    CMD_SYS_REBOOT,
+                    device_ip,
+                    err,
+                )
+                return
+
+        result = response.get("result")
+        if (
+            not isinstance(result, dict)
+            or result.get("set_result") not in TRUTHY_SET_RESULTS
+        ):
+            raise MarstekSetError(
+                device_ip, CMD_SYS_REBOOT, "the device rejected the command"
+            )
 
     async def get_device_info(
         self, device_ip: str, *, port: int | None = None, timeout: float = 5.0

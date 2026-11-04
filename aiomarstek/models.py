@@ -7,6 +7,8 @@ from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from typing import Final, TypeAlias
 
+from .const import POWER_VERSION_CODES
+
 MarstekDeviceVersion: TypeAlias = int | str
 MarstekStatusNumber: TypeAlias = int | float
 MarstekStatusValue: TypeAlias = MarstekStatusNumber | str
@@ -50,10 +52,78 @@ SOC_GLITCH_FLOOR: Final = 10
 # Polls in a row reporting 0 % after which the reading is accepted as real,
 # so a device that is really empty is not held at its last level forever.
 ZERO_SOC_POLLS: Final = 3
+
+
+@dataclass(frozen=True, slots=True)
+class FieldUnit:
+    """Documented unit scale of one numeric reply field.
+
+    ``api_field`` is the property name in the reply, which is not always the
+    status field name (``battery_total_input_energy`` comes from
+    ``bat_total_input_energy``). ``api_unit`` is the scale printed in the
+    Rev 4.0 field table and ``factor`` converts the raw reply value to
+    ``unit``, the unit of the normalized ``MarstekDeviceStatus`` field.
+    """
+
+    api_field: str
+    factor: int | float
+    api_unit: str
+    unit: str
+
+
+# Reply scales of the energy counters, from the "Marstek Device Local API"
+# Rev 4.0 field tables (Bat.GetStatus, ES.GetStatus, ES.GetMode, EM.GetStatus,
+# Energy.GetData), cross-checked against a VenusE 3.0.
+#
+# The scales are deliberately uneven, which is why they live in one table
+# instead of in prose: the same instant is reported as 0.01 kWh by
+# ES.GetStatus/Energy.GetData, 0.1 kWh by Bat.GetStatus, 0.1 Wh by the CT
+# counters and plain Wh by the grid/backup totals. Everything is normalized to
+# Wh so callers can add counters without knowing the source interface.
+#
+# Two fields need a note the Rev 4.0 text does not give:
+# * EM.GetStatus still prints "[Wh] (*0.1)" while ES.GetMode was corrected to
+#   "[0.1 Wh]". Both are read as 0.1 Wh: a measured raw 2306800 is 230.68 kWh,
+#   matching the same counter in ES.GetMode (see the Rev 4.0 doc error report,
+#   HE-2).
+# * backup_input_energy/backup_output_energy are documented as 0.001 kWh, i.e.
+#   Wh, so they are passed through unchanged.
+#
+# The counters are also *not* the same quantity: Bat.GetStatus reports
+# battery-side throughput, whereas Energy.GetData reports grid-side energy --
+# total_charge equals ES.GetStatus.total_grid_input_energy / 10 for the same
+# device and instant. Only the battery totals measure what the cells moved.
+FIELD_UNITS: Final[dict[str, FieldUnit]] = {
+    # ES.GetStatus
+    "total_pv_energy": FieldUnit("total_pv_energy", 10, "0.01 kWh", "Wh"),
+    "total_grid_output_energy": FieldUnit("total_grid_output_energy", 1, "Wh", "Wh"),
+    "total_grid_input_energy": FieldUnit("total_grid_input_energy", 1, "Wh", "Wh"),
+    "total_load_energy": FieldUnit("total_load_energy", 1, "Wh", "Wh"),
+    # ES.GetMode / EM.GetStatus (same CT fields from either source)
+    "ct_input_energy": FieldUnit("input_energy", 0.1, "0.1 Wh", "Wh"),
+    "ct_output_energy": FieldUnit("output_energy", 0.1, "0.1 Wh", "Wh"),
+    # Bat.GetStatus: battery-side lifetime totals
+    "battery_total_input_energy": FieldUnit(
+        "bat_total_input_energy", 100, "0.1 kWh", "Wh"
+    ),
+    "battery_total_output_energy": FieldUnit(
+        "bat_total_output_energy", 100, "0.1 kWh", "Wh"
+    ),
+    "backup_input_energy": FieldUnit("backup_input_energy", 1, "0.001 kWh", "Wh"),
+    "backup_output_energy": FieldUnit("backup_output_energy", 1, "0.001 kWh", "Wh"),
+    # Energy.GetData: grid-side day/month/lifetime counters
+    "energy_day_charge": FieldUnit("day_charge", 10, "0.01 kWh", "Wh"),
+    "energy_day_discharge": FieldUnit("day_discharge", 10, "0.01 kWh", "Wh"),
+    "energy_month_charge": FieldUnit("mon_charge", 10, "0.01 kWh", "Wh"),
+    "energy_month_discharge": FieldUnit("mon_discharge", 10, "0.01 kWh", "Wh"),
+    "energy_total_charge": FieldUnit("total_charge", 10, "0.01 kWh", "Wh"),
+    "energy_total_discharge": FieldUnit("total_discharge", 10, "0.01 kWh", "Wh"),
+}
+
 # Lifetime counters that only ever grow on a healthy device; the Open API
-# documents them as cumulative totals that only a factory reset clears.
-# total_pv_energy is reported in 0.01 kWh and the rest in Wh (input/output
-# energy in 0.1 Wh), but all are monotonic, so a drop is a firmware glitch.
+# documents them as cumulative totals that only a factory reset clears. Their
+# uneven reply scales are in FIELD_UNITS, normalized to Wh before they reach
+# this module, so a drop is a firmware glitch rather than a unit change.
 MONOTONIC_KEYS: Final = (
     "total_pv_energy",
     "total_grid_output_energy",
@@ -61,6 +131,14 @@ MONOTONIC_KEYS: Final = (
     "total_load_energy",
     "ct_input_energy",
     "ct_output_energy",
+    # Battery and Energy.GetData lifetime counters. Unlike the day/month
+    # counters (which reset at midnight/month rollover), these only ever grow.
+    "battery_total_input_energy",
+    "battery_total_output_energy",
+    "backup_input_energy",
+    "backup_output_energy",
+    "energy_total_charge",
+    "energy_total_discharge",
 )
 # Polls in a row a counter has to stay below its previous reading before the
 # drop is accepted as a real reset: a single dip is a device glitch, which
@@ -244,12 +322,46 @@ class MarstekDeviceStatus:
     total_power: MarstekStatusNumber | None = None
     ct_input_energy: MarstekStatusNumber | None = None
     ct_output_energy: MarstekStatusNumber | None = None
-    # Bat.GetStatus fields
+    # Bat.GetStatus fields. The capacities are plain Wh in the reply and are
+    # passed through unscaled; the state of health and the SOC are percentages.
     battery_temperature: MarstekStatusNumber | None = None
     battery_remaining_capacity: MarstekStatusNumber | None = None
     battery_rated_capacity: MarstekStatusNumber | None = None
+    battery_soh: MarstekStatusNumber | None = None
+    # Lifetime battery energy counters (battery-side throughput), normalized to
+    # Wh from their documented scales (see FIELD_UNITS).
+    battery_total_input_energy: MarstekStatusNumber | None = None
+    battery_total_output_energy: MarstekStatusNumber | None = None
+    backup_input_energy: MarstekStatusNumber | None = None
+    backup_output_energy: MarstekStatusNumber | None = None
     charge_permission: bool | None = None
     discharge_permission: bool | None = None
+    # Sys.GetInfo fields
+    dod: MarstekStatusNumber | None = None
+    # Bluetooth lock and front-panel LED: the same settings Ble.Adv and
+    # Led.Ctrl write, so the controls finally have a readable state.
+    bluetooth_advertising: bool | None = None
+    led: bool | None = None
+    # Sys.GetInfo reports the power version as a code; ``power_version`` maps
+    # it to the watt figure Set.Ver takes (see POWER_VERSION_CODES).
+    power_version_code: MarstekStatusNumber | None = None
+    ems_version: MarstekStatusNumber | None = None
+    boot_version: MarstekStatusNumber | None = None
+    bms_version: MarstekStatusNumber | None = None
+    inverter_version: MarstekStatusNumber | None = None
+    # Err.Get fields, parsed from the firmware's hexadecimal strings
+    ems_error: int | None = None
+    bms_error: int | None = None
+    inv_error: int | None = None
+    mppt_error: int | None = None
+    # Energy.GetData fields (grid-side energy, not battery throughput),
+    # normalized to Wh from their documented scale (see FIELD_UNITS).
+    energy_day_charge: MarstekStatusNumber | None = None
+    energy_day_discharge: MarstekStatusNumber | None = None
+    energy_month_charge: MarstekStatusNumber | None = None
+    energy_month_discharge: MarstekStatusNumber | None = None
+    energy_total_charge: MarstekStatusNumber | None = None
+    energy_total_discharge: MarstekStatusNumber | None = None
     # Wifi.GetStatus fields
     wifi_ssid: str | None = None
     wifi_rssi: MarstekStatusNumber | None = None
@@ -273,11 +385,11 @@ class MarstekDeviceStatus:
         b_power = _response_number(response, "b_power", self.b_power)
         c_power = _response_number(response, "c_power", self.c_power)
         total_power = _response_number(response, "total_power", self.total_power)
-        ct_input_energy = _response_scaled_number(
-            response, "input_energy", self.ct_input_energy, 0.1
+        ct_input_energy = _response_field_number(
+            response, "ct_input_energy", self.ct_input_energy
         )
-        ct_output_energy = _response_scaled_number(
-            response, "output_energy", self.ct_output_energy, 0.1
+        ct_output_energy = _response_field_number(
+            response, "ct_output_energy", self.ct_output_energy
         )
 
         battery_status = self.battery_status
@@ -322,19 +434,19 @@ class MarstekDeviceStatus:
         bat_power = _response_number(response, "bat_power", None)
         battery_capacity = _response_number(response, "bat_cap", self.battery_capacity)
         pv_power = _response_number(response, "pv_power", self.pv_power)
-        # The Open API reports PV energy in 0.01 kWh and the other energy
-        # counters in Wh. They are lifetime totals and never reset, so a
-        # lower reading is a device glitch (see hold_glitches).
-        total_pv_energy = _response_scaled_number(
-            response, "total_pv_energy", self.total_pv_energy, 10
+        # These are lifetime totals and never reset, so a lower reading is a
+        # device glitch (see hold_glitches). The reply scale is per field; see
+        # FIELD_UNITS for where each one comes from.
+        total_pv_energy = _response_field_number(
+            response, "total_pv_energy", self.total_pv_energy
         )
-        total_grid_output_energy = _response_number(
+        total_grid_output_energy = _response_field_number(
             response, "total_grid_output_energy", self.total_grid_output_energy
         )
-        total_grid_input_energy = _response_number(
+        total_grid_input_energy = _response_field_number(
             response, "total_grid_input_energy", self.total_grid_input_energy
         )
-        total_load_energy = _response_number(
+        total_load_energy = _response_field_number(
             response, "total_load_energy", self.total_load_energy
         )
         battery_status = self.battery_status
@@ -401,6 +513,21 @@ class MarstekDeviceStatus:
         battery_rated_capacity = _response_number(
             response, "rated_capacity", self.battery_rated_capacity
         )
+        battery_soh = _response_number(response, "bat_soh", self.battery_soh)
+        # The battery totals are 0.1 kWh and the backup totals 0.001 kWh; see
+        # FIELD_UNITS.
+        battery_total_input_energy = _response_field_number(
+            response, "battery_total_input_energy", self.battery_total_input_energy
+        )
+        battery_total_output_energy = _response_field_number(
+            response, "battery_total_output_energy", self.battery_total_output_energy
+        )
+        backup_input_energy = _response_field_number(
+            response, "backup_input_energy", self.backup_input_energy
+        )
+        backup_output_energy = _response_field_number(
+            response, "backup_output_energy", self.backup_output_energy
+        )
         charge_permission = _response_bool(
             response, "charg_flag", self.charge_permission
         )
@@ -414,8 +541,113 @@ class MarstekDeviceStatus:
             battery_temperature=battery_temperature,
             battery_remaining_capacity=battery_remaining_capacity,
             battery_rated_capacity=battery_rated_capacity,
+            battery_soh=battery_soh,
+            battery_total_input_energy=battery_total_input_energy,
+            battery_total_output_energy=battery_total_output_energy,
+            backup_input_energy=backup_input_energy,
+            backup_output_energy=backup_output_energy,
             charge_permission=charge_permission,
             discharge_permission=discharge_permission,
+        )
+
+    def with_sys_info_response(
+        self, response: Mapping[str, object]
+    ) -> MarstekDeviceStatus:
+        """Return status updated with a Sys.GetInfo response.
+
+        Besides the discharge depth, the reply mirrors the settings the write
+        commands expose -- the Bluetooth lock (``ble_adv_en``) and the
+        front-panel LED (``led_state``) -- so those controls can report the
+        value the device actually holds instead of staying write-only. The
+        firmware versions are kept as reported and not normalized.
+
+        ``ble_adv_en`` is read as "Bluetooth advertising is enabled"
+        (1: on, 0: off), matching the field name and the polarity
+        ``set_ble_adv(True)`` sends (1). The Open API's ``(Bluetooth lock)
+        enabled`` annotation for the same field describes the lock, which has
+        the opposite sense, so this is the one polarity worth confirming
+        against real hardware: if toggling the control on makes the device
+        report 0, the flag is inverted.
+        """
+        return replace(
+            self,
+            dod=_response_number(response, "dod", self.dod),
+            bluetooth_advertising=_response_bool(
+                response, "ble_adv_en", self.bluetooth_advertising
+            ),
+            led=_response_bool(response, "led_state", self.led),
+            power_version_code=_response_number(
+                response, "set_ver", self.power_version_code
+            ),
+            ems_version=_response_number(response, "ems_app_ver", self.ems_version),
+            boot_version=_response_number(response, "boot_ver", self.boot_version),
+            bms_version=_response_number(response, "bms_ver", self.bms_version),
+            inverter_version=_response_number(
+                response, "inv_ver", self.inverter_version
+            ),
+        )
+
+    @property
+    def power_version(self) -> int | None:
+        """Return the power version in watts, mapped from the firmware code.
+
+        ``Set.Ver`` takes the watt figure while ``Sys.GetInfo`` reports a code
+        (0: 2500 W, 1: 800 W, 3: 2200 W, 5: 1500 W). A code the Open API does
+        not document maps to None rather than to a guessed figure.
+        """
+        if self.power_version_code is None:
+            return None
+        return POWER_VERSION_CODES.get(int(self.power_version_code))
+
+    def with_error_response(
+        self, response: Mapping[str, object]
+    ) -> MarstekDeviceStatus:
+        """Return status updated with an Err.Get response.
+
+        The firmware reports each subsystem's bitmask as a hexadecimal
+        *string* (``"0x800"``), not the number the Open API documents, so the
+        values are parsed base 16 and kept as integers for comparison.
+        """
+        return replace(
+            self,
+            ems_error=_response_hex(response, "EMS_ERR", self.ems_error),
+            bms_error=_response_hex(response, "BMS_ERR", self.bms_error),
+            inv_error=_response_hex(response, "INV_ERR", self.inv_error),
+            mppt_error=_response_hex(response, "MPPT_ERR", self.mppt_error),
+        )
+
+    def with_energy_response(
+        self, response: Mapping[str, object]
+    ) -> MarstekDeviceStatus:
+        """Return status updated with an Energy.GetData response.
+
+        The counters are documented in 0.01 kWh and normalized to Wh here (see
+        FIELD_UNITS), so they share a unit with the lifetime energy sensors fed
+        by ES.GetStatus. Note they are grid-side energy, not battery throughput:
+        ``total_charge`` equals ``ES.GetStatus.total_grid_input_energy / 10``
+        for the same device and instant. Battery-side totals come from
+        ``with_battery_status_response``.
+        """
+        return replace(
+            self,
+            energy_day_charge=_response_field_number(
+                response, "energy_day_charge", self.energy_day_charge
+            ),
+            energy_day_discharge=_response_field_number(
+                response, "energy_day_discharge", self.energy_day_discharge
+            ),
+            energy_month_charge=_response_field_number(
+                response, "energy_month_charge", self.energy_month_charge
+            ),
+            energy_month_discharge=_response_field_number(
+                response, "energy_month_discharge", self.energy_month_discharge
+            ),
+            energy_total_charge=_response_field_number(
+                response, "energy_total_charge", self.energy_total_charge
+            ),
+            energy_total_discharge=_response_field_number(
+                response, "energy_total_discharge", self.energy_total_discharge
+            ),
         )
 
     def with_wifi_status_response(
@@ -455,11 +687,11 @@ class MarstekDeviceStatus:
         b_power = _response_number(response, "b_power", self.b_power)
         c_power = _response_number(response, "c_power", self.c_power)
         total_power = _response_number(response, "total_power", self.total_power)
-        ct_input_energy = _response_scaled_number(
-            response, "input_energy", self.ct_input_energy, 0.1
+        ct_input_energy = _response_field_number(
+            response, "ct_input_energy", self.ct_input_energy
         )
-        ct_output_energy = _response_scaled_number(
-            response, "output_energy", self.ct_output_energy, 0.1
+        ct_output_energy = _response_field_number(
+            response, "ct_output_energy", self.ct_output_energy
         )
 
         return replace(
@@ -574,6 +806,53 @@ def _response_scaled_number(
         return previous_value
     value = _response_number(response, key, None)
     return value * scale if value is not None else None
+
+
+def _response_field_number(
+    response: Mapping[str, object],
+    field: str,
+    previous_value: MarstekStatusNumber | None,
+) -> MarstekStatusNumber | None:
+    """Return a status field parsed with its documented reply scale.
+
+    The scale (and the reply property name, which differs for some fields) is
+    looked up in FIELD_UNITS, so the uneven 0.01 kWh / 0.1 kWh / 0.1 Wh / Wh
+    scales live in exactly one place.
+    """
+    unit = FIELD_UNITS[field]
+    return _response_scaled_number(
+        response, unit.api_field, previous_value, unit.factor
+    )
+
+
+def _response_hex(
+    response: Mapping[str, object], key: str, previous_value: int | None
+) -> int | None:
+    """Return a hexadecimal-string response field as an integer bitmask.
+
+    ``Err.Get`` replies with strings such as ``"0x800"`` despite the Open API
+    documenting numbers, so every string is read base 16 (the ``0x`` prefix is
+    optional). A real number is accepted as-is, so firmware that follows the
+    documented form keeps working.
+    """
+    if key not in response:
+        return previous_value
+
+    value = response[key]
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise TypeError(f"{key} must be a hexadecimal string or a number")
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        try:
+            return int(value.strip(), 16)
+        except ValueError as err:
+            raise ValueError(
+                f"{key} must be a hexadecimal string, got {value!r}"
+            ) from err
+    raise TypeError(f"{key} must be a hexadecimal string or a number")
 
 
 def _response_bool(

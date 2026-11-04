@@ -12,6 +12,8 @@ from .const import (
     CMD_DISCOVER,
     CMD_DOD_SET,
     CMD_EM_STATUS,
+    CMD_ENERGY_DATA,
+    CMD_ERR_GET,
     CMD_ES_MODE,
     CMD_ES_SET_MODE,
     CMD_ES_STATUS,
@@ -19,7 +21,10 @@ from .const import (
     CMD_LED_CTRL,
     CMD_PV_GET_STATUS,
     CMD_SET_VER,
+    CMD_SYS_INFO,
+    CMD_SYS_REBOOT,
     CMD_WIFI_STATUS,
+    REBOOT_TARGETS,
 )
 from .models import MarstekManualSlot, MarstekModeConfig
 
@@ -110,6 +115,32 @@ def get_ble_status(device_id: int = 0) -> str:
 def get_em_status(device_id: int = 0) -> str:
     """Get energy meter / CT status command."""
     return build_command(CMD_EM_STATUS, {"id": device_id})
+
+
+def get_sys_info(device_id: int = 0) -> str:
+    """Get system settings (DOD, Bluetooth lock, LED, firmware versions)."""
+    return build_command(CMD_SYS_INFO, {"id": device_id})
+
+
+def get_errors(device_id: int = 0) -> str:
+    """Get the device's current error codes (EMS, BMS, INV, MPPT)."""
+    return build_command(CMD_ERR_GET, {"id": device_id})
+
+
+def get_energy_data(device_id: int = 0) -> str:
+    """Get cumulative charge/discharge energy for today, this month and total."""
+    return build_command(CMD_ENERGY_DATA, {"id": device_id})
+
+
+def reboot(target: str = "ems", device_id: int = 0) -> str:
+    """Build a Sys.Reboot command for the given target (ems, inv or bms)."""
+    try:
+        reboot_type = REBOOT_TARGETS[target]
+    except KeyError as err:
+        raise ValueError(
+            f"reboot target must be one of {', '.join(REBOOT_TARGETS)}, got {target!r}"
+        ) from err
+    return build_command(CMD_SYS_REBOOT, {"id": device_id, "type": reboot_type})
 
 
 def set_es_mode(config: MarstekModeConfig, device_id: int = 0) -> str:

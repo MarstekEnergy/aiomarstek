@@ -593,6 +593,47 @@ async def test_get_device_status_throttles_extras(
     assert requests.count("Wifi.GetStatus") == 1
 
 
+async def test_get_device_status_forces_extras(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """force_extras runs the slow group out of cycle and resets the counter."""
+    from aiomarstek import EXTRAS_INTERVAL
+
+    client = MarstekUDPClient()
+    requests: list[str] = []
+
+    async def fake_send_request(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        request = json.loads(args[0])
+        requests.append(request["method"])
+        if request["method"] == "PV.GetStatus":
+            return {"error": {"code": -32601}}
+        if request["method"] == "ES.GetStatus":
+            return {"result": {"bat_soc": 90}}
+        # Extras methods: an empty result keeps the previous fields (None) and
+        # still counts as answered, which is all this test needs.
+        return {"result": {}}
+
+    monkeypatch.setattr(client, "send_request", fake_send_request)
+
+    # Prime the counter with a couple of polls that do not reach the boundary.
+    assert EXTRAS_INTERVAL > 2
+    for _ in range(2):
+        await client.get_device_status("192.168.1.10", delay_ms=0)
+    assert "Wifi.GetStatus" not in requests
+
+    # A forced poll runs the slow group now, regardless of the counter.
+    await client.get_device_status("192.168.1.10", delay_ms=0, force_extras=True)
+    assert requests.count("Wifi.GetStatus") == 1
+    assert requests.count("BLE.GetStatus") == 1
+    assert requests.count("Sys.GetInfo") == 1
+    assert requests.count("Err.Get") == 1
+    assert requests.count("Energy.GetData") == 1
+
+    # The counter was reset, so the next regular poll does not re-query.
+    await client.get_device_status("192.168.1.10", delay_ms=0)
+    assert requests.count("Wifi.GetStatus") == 1
+
+
 async def test_get_device_status_merges_extras(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -963,7 +1004,7 @@ async def test_listener_records_last_response_time(
 async def test_extras_queries_are_spaced(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """WiFi, BLE and EM queries are spaced by the poll delay."""
+    """Every extras query is spaced by the poll delay and lands in the status."""
     client = MarstekUDPClient()
     client._extras_age["192.168.1.10"] = 99  # Force the extras cycle.
     sleeps: list[float] = []
@@ -982,17 +1023,31 @@ async def test_extras_queries_are_spaced(
             return {"result": {"state": "connect"}}
         if method == "EM.GetStatus":
             return {"result": {"ct_state": 1, "total_power": 120}}
+        if method == "Energy.GetData":
+            return {"result": {"day_charge": 12, "mon_discharge": 45}}
+        if method == "Sys.GetInfo":
+            return {"result": {"dod": 40}}
+        if method == "Err.Get":
+            return {"result": {"EMS_ERR": "0x800"}}
         if method == "ES.GetStatus":
             return {"result": {"bat_soc": 90}}
         return {"result": {"mode": 0}}
 
     monkeypatch.setattr(client, "send_request", fake_send_request)
 
-    await client.get_device_status("192.168.1.10", delay_ms=2000, include_pv=False)
+    status = await client.get_device_status(
+        "192.168.1.10", delay_ms=2000, include_pv=False
+    )
 
     # One delay between each pair of queries: es_status->es_mode,
-    # es_mode->battery, battery->extras, wifi->ble and ble->em.
-    assert sleeps.count(2.0) == 5
+    # es_mode->battery, battery->extras, then the five gaps between the six
+    # extras queries (WiFi, BLE, EM, energy, system info, errors).
+    assert sleeps.count(2.0) == 8
+    # The new components are parsed into the same status snapshot.
+    assert status.dod == 40
+    assert status.ems_error == 0x800
+    assert status.energy_day_charge == 120
+    assert status.energy_month_discharge == 450
 
 
 async def test_status_smoothing_holds_soc_spike_then_recovers(
@@ -1127,6 +1182,129 @@ async def test_status_smoothing_survives_failed_poll(
     assert first.battery_soc == 50
     assert third.battery_soc == 50  # spike held; the silent poll kept the streak
     assert client._zero_soc_polls["1.2.3.4"] == 1
+
+
+def _per_energy_reply(
+    replies: list[dict[str, Any]],
+) -> Any:
+    """Fake send_request serving one Energy.GetData reply per extras cycle.
+
+    ES.GetStatus, ES.GetMode and Bat.GetStatus always answer, PV.GetStatus is
+    unsupported, and every other extras query returns an empty result, so only
+    the Energy.GetData replies drive the energy counters.
+    """
+
+    async def fake_send_request(
+        message: str, *args: Any, **kwargs: Any
+    ) -> dict[str, Any]:
+        method = json.loads(message)["method"]
+        if method == "ES.GetStatus":
+            return {"result": {"bat_soc": 90}}
+        if method == "ES.GetMode":
+            return {"result": {"mode": 0}}
+        if method == "PV.GetStatus":
+            return {"error": {"code": -32601}}
+        if method == "Bat.GetStatus":
+            return {"result": {"soc": 90}}
+        if method == "Energy.GetData":
+            return {"result": replies.pop(0)}
+        return {"result": {}}
+
+    return fake_send_request
+
+
+def test_every_monotonic_counter_is_mapped_to_a_reply_field() -> None:
+    """A new monotonic counter must declare where its fresh reading comes from.
+
+    A key missing from the map is never considered fresh, so its drop streak
+    would never advance and a real reset would stay hidden forever.
+    """
+    from aiomarstek.models import MONOTONIC_KEYS
+    from aiomarstek.udp_client import MONOTONIC_FRESH_FIELDS
+
+    mapped = {key for fields in MONOTONIC_FRESH_FIELDS.values() for key in fields}
+    assert mapped == set(MONOTONIC_KEYS)
+
+
+async def test_counter_reset_survives_polls_that_skip_the_counter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A real reset is accepted even though ordinary polls carry the old value.
+
+    The lifetime counters come from the slow extras group. The polls between
+    two extras cycles do not query them, so their fields still hold the last
+    smoothed value; treating that carried value as a reading used to clear the
+    drop streak every time, leaving the counter stuck at its old value for as
+    long as the new reading stayed below it.
+    """
+    from aiomarstek import EXTRAS_INTERVAL
+
+    client = MarstekUDPClient()
+    monkeypatch.setattr(
+        client,
+        "send_request",
+        _per_energy_reply(
+            [
+                {"total_charge": 100},
+                {"total_charge": 1},
+                {"total_charge": 1},
+                {"total_charge": 1},
+            ]
+        ),
+    )
+    streak = client._falling_energy_polls.setdefault("1.2.3.4", {})
+
+    first = await client.get_device_status("1.2.3.4", delay_ms=0, force_extras=True)
+    assert first.energy_total_charge == 1000  # total_charge is scaled by 10
+
+    # First drop: held, because a single dip is a firmware glitch.
+    second = await client.get_device_status("1.2.3.4", delay_ms=0, force_extras=True)
+    assert second.energy_total_charge == 1000
+    assert streak["energy_total_charge"] == 1
+
+    # Ordinary polls between the two extras cycles: no Energy.GetData query,
+    # so the carried value must not clear the streak.
+    for _ in range(EXTRAS_INTERVAL - 1):
+        carried = await client.get_device_status("1.2.3.4", delay_ms=0)
+        assert carried.energy_total_charge == 1000
+        assert streak["energy_total_charge"] == 1
+
+    # The drop repeats on each real reading and is eventually accepted.
+    third = await client.get_device_status("1.2.3.4", delay_ms=0, force_extras=True)
+    assert third.energy_total_charge == 1000
+    fourth = await client.get_device_status("1.2.3.4", delay_ms=0, force_extras=True)
+    assert fourth.energy_total_charge == 10
+
+
+async def test_counter_streak_survives_replies_without_the_field(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A reply that omits a counter leaves its drop streak untouched."""
+    client = MarstekUDPClient()
+    monkeypatch.setattr(
+        client,
+        "send_request",
+        _per_energy_reply(
+            [
+                {"total_charge": 100},
+                {"total_charge": 1},
+                {},  # firmware reply without the counter
+                {"total_charge": 1},
+                {"total_charge": 1},
+            ]
+        ),
+    )
+
+    polls = [
+        await client.get_device_status("1.2.3.4", delay_ms=0, force_extras=True)
+        for _ in range(5)
+    ]
+
+    assert polls[0].energy_total_charge == 1000
+    assert polls[1].energy_total_charge == 1000  # dip held
+    assert polls[2].energy_total_charge == 1000  # absent field: streak kept
+    assert polls[3].energy_total_charge == 1000  # dip still below the threshold
+    assert polls[4].energy_total_charge == 10  # accepted past the threshold
 
 
 class _FakeSock:
@@ -1267,6 +1445,93 @@ async def test_listener_survives_dispatch_exception(
     # The bad packet did not kill the loop; the second packet was dispatched.
     assert calls == 2
     assert future.result() == {"id": 42, "result": {"ok": 1}}
+
+
+async def test_parse_error_id_zero_resolves_outstanding_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An id=0 Parse error is delivered to the single outstanding waiter.
+
+    Marstek firmware answers a request it could not parse with a JSON-RPC
+    error whose id is 0 (e.g. -32700 Parse error, data 403), regardless of
+    the request's real id. Without attribution the error is dropped and the
+    real waiter blocks until its timeout; this pins the fix that resolves
+    the waiter immediately so the caller can fall back without waiting.
+    """
+    client = MarstekUDPClient(verify_source_ip=False)
+    loop = asyncio.get_running_loop()
+    future: asyncio.Future = loop.create_future()
+    client._pending_requests[4786] = (future, "1.2.3.4")
+
+    await _drive_listen(
+        client,
+        [
+            (
+                json.dumps(
+                    {
+                        "id": 0,
+                        "src": "VNSE3-0-3c1acc36b327",
+                        "error": {
+                            "code": -32700,
+                            "message": "Parse error",
+                            "data": 403,
+                        },
+                    }
+                ).encode(),
+                ("1.2.3.4", 30000),
+            )
+        ],
+        monkeypatch,
+    )
+
+    # The error resolved the outstanding request instead of being dropped.
+    assert future.done()
+    result = future.result()
+    assert result["error"]["code"] == -32700
+    assert 4786 not in client._pending_requests
+
+
+async def test_parse_error_id_zero_dropped_when_multiple_waiters(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With several outstanding requests an id=0 error is not attributed.
+
+    When more than one request is outstanding the id=0 error cannot be
+    safely matched to a specific waiter, so it is still dropped rather than
+    risk resolving the wrong request.
+    """
+    client = MarstekUDPClient(verify_source_ip=False)
+    loop = asyncio.get_running_loop()
+    future_a: asyncio.Future = loop.create_future()
+    future_b: asyncio.Future = loop.create_future()
+    client._pending_requests[1] = (future_a, "1.2.3.4")
+    client._pending_requests[2] = (future_b, "5.6.7.8")
+
+    await _drive_listen(
+        client,
+        [
+            (
+                json.dumps(
+                    {
+                        "id": 0,
+                        "error": {
+                            "code": -32700,
+                            "message": "Parse error",
+                            "data": 403,
+                        },
+                    }
+                ).encode(),
+                ("1.2.3.4", 30000),
+            )
+        ],
+        monkeypatch,
+    )
+
+    # Ambiguous attribution: neither waiter is resolved; both still pending.
+    assert not future_a.done()
+    assert not future_b.done()
+    assert 1 in client._pending_requests
+    assert 2 in client._pending_requests
 
 
 async def test_consecutive_recv_errors_trigger_rebind(

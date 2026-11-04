@@ -43,6 +43,39 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
+## Units
+
+Numeric status fields are normalized, so a consumer does not have to know which
+interface reported a value. Every energy counter is in **Wh**, although the
+reply scales differ per interface and per field:
+
+| Reply | Counters | Scale |
+| --- | --- | --- |
+| `ES.GetStatus` | `total_pv_energy` | 0.01 kWh |
+| `ES.GetStatus` | grid and load totals | Wh |
+| `Bat.GetStatus` | `bat_total_*_energy` | 0.1 kWh |
+| `Bat.GetStatus` | `backup_*_energy` | 0.001 kWh (i.e. Wh) |
+| `ES.GetMode` / `EM.GetStatus` | CT `input_energy` / `output_energy` | 0.1 Wh |
+| `Energy.GetData` | day, month and total charge/discharge | 0.01 kWh |
+
+`FIELD_UNITS` in `aiomarstek/models.py` is the single source of truth: it records
+the reply property name, the documented scale and the normalized unit of each
+scaled field, and the parsers take their factor from it. The scales follow the
+*Marstek Device Local API* Rev 4.0 field tables, cross-checked against a
+VenusE 3.0. Two points where the document alone is misleading:
+
+- `EM.GetStatus.input_energy` / `output_energy` still print `[Wh] (*0.1)` in
+  Rev 4.0, while `ES.GetMode` was corrected to `[0.1 Wh]`. Both are read as
+  0.1 Wh, which reproduces the measured 230.68 kWh for a raw 2306800.
+- The `Energy.GetData` counters are grid-side energy, not battery throughput:
+  `total_charge` equals `ES.GetStatus.total_grid_input_energy / 10` at the same
+  instant. The battery-side totals are `battery_total_input_energy` /
+  `battery_total_output_energy` from `Bat.GetStatus`.
+
+Unscaled fields keep the unit the device reports: power in W, voltage in V,
+current in A, `battery_soc` / `dod` / `battery_soh` in %, `battery_temperature`
+in °C and the battery capacities in Wh.
+
 ## Security considerations
 
 The protocol is unauthenticated: `build_command` emits only `id`, `method` and

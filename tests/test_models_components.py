@@ -97,6 +97,200 @@ def test_battery_status_parses_response() -> None:
     assert status.battery_rated_capacity == 2560.0
 
 
+def test_battery_status_parses_health_and_lifetime_energy() -> None:
+    """The Bat.GetStatus health/lifetime fields are captured and scaled to Wh."""
+    status = MarstekDeviceStatus(device_ip="192.168.1.10").with_battery_status_response(
+        {
+            "soc": 29,
+            # 0.1 kWh units -> Wh.
+            "bat_soh": 99.0,
+            "bat_total_input_energy": 1220,
+            "bat_total_output_energy": 975,
+            # 0.001 kWh units -> Wh (already Wh).
+            "backup_input_energy": 0,
+            "backup_output_energy": 12,
+        }
+    )
+
+    assert status.battery_soh == 99.0
+    assert status.battery_total_input_energy == 122000
+    assert status.battery_total_output_energy == 97500
+    assert status.backup_input_energy == 0
+    assert status.backup_output_energy == 12
+
+
+def test_sys_info_parses_dod() -> None:
+    """Sys.GetInfo reports the discharge depth the device actually uses."""
+    status = MarstekDeviceStatus(device_ip="192.168.1.10").with_sys_info_response(
+        {"id": 0, "dod": 40, "ble_state": 0, "ble_adv_en": 1, "led_state": 0}
+    )
+
+    assert status.dod == 40
+
+
+def test_sys_info_reports_the_settings_it_mirrors() -> None:
+    """ble_adv_en/led_state mirror the write-only Bluetooth and LED controls."""
+    status = MarstekDeviceStatus(device_ip="192.168.1.10").with_sys_info_response(
+        {"id": 0, "ble_adv_en": 1, "led_state": 0}
+    )
+
+    assert status.bluetooth_advertising is True
+    assert status.led is False
+
+    status = status.with_sys_info_response({"id": 0, "ble_adv_en": 0, "led_state": 1})
+
+    assert status.bluetooth_advertising is False
+    assert status.led is True
+
+
+def test_sys_info_maps_power_version_code_to_watts() -> None:
+    """set_ver is a code; Set.Ver takes watts, so it is mapped."""
+    status = MarstekDeviceStatus(device_ip="192.168.1.10").with_sys_info_response(
+        {"id": 0, "set_ver": 0}
+    )
+    assert status.power_version == 2500
+
+    for code, watts in ((1, 800), (3, 2200), (5, 1500)):
+        status = MarstekDeviceStatus(
+            device_ip="192.168.1.10", power_version_code=code
+        ).with_sys_info_response({"id": 0})
+        assert status.power_version == watts
+
+    # An undocumented code maps to nothing instead of a guessed watt figure.
+    unknown = MarstekDeviceStatus(device_ip="192.168.1.10").with_sys_info_response(
+        {"id": 0, "set_ver": 2}
+    )
+    assert unknown.power_version is None
+
+
+def test_sys_info_parses_firmware_versions() -> None:
+    """The four firmware versions in Sys.GetInfo are kept as reported."""
+    status = MarstekDeviceStatus(device_ip="192.168.1.10").with_sys_info_response(
+        {
+            "id": 0,
+            "ems_app_ver": 1513,
+            "boot_ver": 18,
+            "bms_ver": 115,
+            "inv_ver": 1207,
+        }
+    )
+
+    assert status.ems_version == 1513
+    assert status.boot_version == 18
+    assert status.bms_version == 115
+    assert status.inverter_version == 1207
+
+
+def test_error_response_parses_hex_strings() -> None:
+    """Err.Get reports hexadecimal strings, parsed base 16 into bitmasks."""
+    status = MarstekDeviceStatus(device_ip="192.168.1.10").with_error_response(
+        {"EMS_ERR": "0x800", "BMS_ERR": "0x0", "INV_ERR": "0", "MPPT_ERR": "0x10"}
+    )
+
+    assert status.ems_error == 0x800
+    assert status.bms_error == 0
+    assert status.inv_error == 0
+    assert status.mppt_error == 0x10
+
+
+def test_error_response_accepts_documented_numbers() -> None:
+    """A firmware that sends real numbers instead of strings still parses."""
+    status = MarstekDeviceStatus(device_ip="192.168.1.10").with_error_response(
+        {"EMS_ERR": 2048, "BMS_ERR": None}
+    )
+
+    assert status.ems_error == 2048
+    assert status.bms_error is None
+
+
+def test_error_response_rejects_non_hex_values() -> None:
+    """A malformed error code raises instead of silently reading as zero."""
+    with pytest.raises(ValueError):
+        MarstekDeviceStatus(device_ip="192.168.1.10").with_error_response(
+            {"EMS_ERR": "nope"}
+        )
+
+
+def test_energy_response_scales_to_wh() -> None:
+    """Energy.GetData counters are 0.01 kWh and normalized to Wh."""
+    status = MarstekDeviceStatus(device_ip="192.168.1.10").with_energy_response(
+        {
+            "day_charge": 12,
+            "day_discharge": 45,
+            "mon_charge": 380,
+            "mon_discharge": 1120,
+            "total_charge": 5600,
+            "total_discharge": 18400,
+        }
+    )
+
+    assert status.energy_day_charge == 120
+    assert status.energy_day_discharge == 450
+    assert status.energy_month_charge == 3800
+    assert status.energy_month_discharge == 11200
+    assert status.energy_total_charge == 56000
+    assert status.energy_total_discharge == 184000
+
+
+def test_documented_scales_reproduce_measured_counters() -> None:
+    """The Rev 4.0 reply scales match the measured same-instant readings.
+
+    The Rev 4.0 doc error report (HE-2) measured one instant on a VenusE 3.0:
+    Bat.GetStatus.bat_total_input_energy 213 (21.3 kWh), Energy.GetData
+    .total_charge 297 (2.97 kWh), ES.GetStatus.total_grid_input_energy 2973
+    (2.97 kWh) and EM.GetStatus.input_energy 2306800 (230.68 kWh).
+    """
+    status = MarstekDeviceStatus(device_ip="192.168.1.10")
+
+    bat = status.with_battery_status_response({"bat_total_input_energy": 213})
+    energy = status.with_energy_response({"total_charge": 297})
+    grid = status.with_es_status_response({"total_grid_input_energy": 2973})
+    em = status.with_em_status_response({"input_energy": 2306800})
+
+    assert bat.battery_total_input_energy == 21300  # 0.1 kWh -> 21.3 kWh
+    assert energy.energy_total_charge == 2970  # 0.01 kWh -> 2.97 kWh
+    assert grid.total_grid_input_energy == 2973  # plain Wh -> 2.97 kWh
+    assert em.ct_input_energy == 230680.0  # 0.1 Wh -> 230.68 kWh
+
+
+def test_monotonic_counters_have_a_documented_unit() -> None:
+    """Every monotonic counter must declare its reply scale.
+
+    The scales are uneven, so a counter missing from FIELD_UNITS would silently
+    be passed through unscaled.
+    """
+    from aiomarstek.models import FIELD_UNITS, MONOTONIC_KEYS
+
+    assert set(MONOTONIC_KEYS) <= set(FIELD_UNITS)
+
+
+def test_lifetime_counters_are_glitch_protected() -> None:
+    """Battery and Energy.GetData lifetime counters never regress."""
+    from aiomarstek import MONOTONIC_KEYS, hold_glitches
+
+    for key in (
+        "battery_total_input_energy",
+        "battery_total_output_energy",
+        "backup_input_energy",
+        "backup_output_energy",
+        "energy_total_charge",
+        "energy_total_discharge",
+    ):
+        assert key in MONOTONIC_KEYS
+
+    previous = MarstekDeviceStatus(
+        device_ip="192.168.1.10", energy_total_charge=56000, energy_day_charge=120
+    )
+    current = MarstekDeviceStatus(
+        device_ip="192.168.1.10", energy_total_charge=10, energy_day_charge=0
+    )
+    held = hold_glitches(previous, current)
+
+    # The lifetime counter is held; the day counter is allowed to reset.
+    assert held.energy_total_charge == 56000
+    assert held.energy_day_charge == 0
+
+
 def test_battery_status_keeps_previous_on_partial_response() -> None:
     """Fields absent from a response keep their previous value."""
     status = MarstekDeviceStatus(

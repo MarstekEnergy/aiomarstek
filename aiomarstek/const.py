@@ -21,6 +21,10 @@ CMD_BLE_ADV: Final = "Ble.Adv"
 CMD_LED_CTRL: Final = "Led.Ctrl"
 CMD_SET_VER: Final = "Set.Ver"
 CMD_FACTORY_RESET: Final = "Reset.Factory"
+CMD_SYS_INFO: Final = "Sys.GetInfo"
+CMD_SYS_REBOOT: Final = "Sys.Reboot"
+CMD_ERR_GET: Final = "Err.Get"
+CMD_ENERGY_DATA: Final = "Energy.GetData"
 
 # Set result values a device may report for a successful write. The Open API
 # document spells the boolean as "ture" in every example response, so string
@@ -33,6 +37,24 @@ DOD_MAX: Final = 88
 
 # Power versions documented for the Set.Ver command, in watts.
 POWER_VERSIONS: Final = (800, 1200, 1500, 2200, 2500)
+
+# Sys.GetInfo reports the power version as a *code*, not as the watt figure
+# Set.Ver takes: 0 -> 2500 W, 1 -> 800 W, 3 -> 2200 W (Venus D), 5 -> 1500 W
+# (Venus A). Codes outside this table are firmware versions the Open API does
+# not document yet, so they map to nothing rather than to a guessed figure.
+POWER_VERSION_CODES: Final[dict[int, int]] = {0: 2500, 1: 800, 3: 2200, 5: 1500}
+
+# Reboot targets documented for the Sys.Reboot command. Type 1 restarts the
+# EMS, which is the controller the local API talks to -- effectively a device
+# restart; 2 and 3 restart the inverter and the BMS on their own.
+REBOOT_EMS: Final = 1
+REBOOT_INV: Final = 2
+REBOOT_BMS: Final = 3
+REBOOT_TARGETS: Final[dict[str, int]] = {
+    "ems": REBOOT_EMS,
+    "inv": REBOOT_INV,
+    "bms": REBOOT_BMS,
+}
 
 # Polls between refreshes of the slow-changing status commands (WiFi, BLE
 # and EM). They answer within the same poll cycle but rarely change, so
