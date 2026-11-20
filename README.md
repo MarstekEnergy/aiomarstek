@@ -55,7 +55,7 @@ reply scales differ per interface and per field:
 | `ES.GetStatus` | grid and load totals | Wh |
 | `Bat.GetStatus` | `bat_total_*_energy` | 0.1 kWh |
 | `Bat.GetStatus` | `backup_*_energy` | 0.001 kWh (i.e. Wh) |
-| `ES.GetMode` / `EM.GetStatus` | CT `input_energy` / `output_energy` | 0.1 Wh |
+| `EM.GetStatus` | CT `input_energy` / `output_energy` | 0.1 Wh |
 | `Energy.GetData` | day, month and total charge/discharge | 0.01 kWh |
 
 `FIELD_UNITS` in `aiomarstek/models.py` is the single source of truth: it records
@@ -65,8 +65,11 @@ scaled field, and the parsers take their factor from it. The scales follow the
 VenusE 3.0. Two points where the document alone is misleading:
 
 - `EM.GetStatus.input_energy` / `output_energy` still print `[Wh] (*0.1)` in
-  Rev 4.0, while `ES.GetMode` was corrected to `[0.1 Wh]`. Both are read as
-  0.1 Wh, which reproduces the measured 230.68 kWh for a raw 2306800.
+  Rev 4.0. They are read as 0.1 Wh, which reproduces the measured 230.68 kWh
+  for a raw 2306800. `ES.GetMode` repeats the CT fields with the corrected
+  `[0.1 Wh]` scale, but only documents them as valid in Auto and AI mode, so
+  the library ignores that copy: `EM.GetStatus` is the single source of the CT
+  fields (`ct_state`, phase/total power and the two energy counters).
 - The `Energy.GetData` counters are grid-side energy, not battery throughput:
   `total_charge` equals `ES.GetStatus.total_grid_input_energy / 10` at the same
   instant. The battery-side totals are `battery_total_input_energy` /

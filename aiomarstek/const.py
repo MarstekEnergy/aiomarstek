@@ -56,9 +56,10 @@ REBOOT_TARGETS: Final[dict[str, int]] = {
     "bms": REBOOT_BMS,
 }
 
-# Polls between refreshes of the slow-changing status commands (WiFi, BLE
-# and EM). They answer within the same poll cycle but rarely change, so
-# querying them on every poll only adds UDP round trips.
+# Polls between refreshes of the slow-changing status commands (WiFi, BLE,
+# energy, system info and errors). They answer within the same poll cycle but
+# rarely change, so querying them on every poll only adds UDP round trips.
+# EM.GetStatus is not in this group: it is the only source of the CT fields.
 EXTRAS_INTERVAL: Final = 5
 
 # Minimum quiet time, in seconds, between a device's last response and the

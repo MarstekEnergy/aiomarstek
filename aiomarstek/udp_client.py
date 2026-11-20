@@ -88,10 +88,6 @@ MONOTONIC_FRESH_FIELDS: Final = {
         "total_grid_input_energy": "total_grid_input_energy",
         "total_load_energy": "total_load_energy",
     },
-    CMD_ES_MODE: {
-        "ct_input_energy": "input_energy",
-        "ct_output_energy": "output_energy",
-    },
     CMD_BATTERY_STATUS: {
         "battery_total_input_energy": "bat_total_input_energy",
         "battery_total_output_energy": "bat_total_output_energy",
@@ -1001,14 +997,15 @@ class MarstekUDPClient:
         queried without a dedicated client. The local listen socket stays
         fixed, so responses always come back to the same port.
 
-        Queries ES.GetStatus, ES.GetMode and Bat.GetStatus on every call,
-        PV.GetStatus for devices with DC PV inputs, and the slow-changing
-        WiFi, BLE, EM, energy, system-info and error components every
-        ``EXTRAS_INTERVAL`` calls. ``force_extras`` runs that slow-changing
-        group on this call regardless of the counter (the readback for the
-        controls follows from ``Sys.GetInfo``, so the caller forces it after a
-        write), and resets the counter so the next regular extras cycle stays a
-        full interval away.
+        Queries ES.GetStatus, ES.GetMode, EM.GetStatus and Bat.GetStatus on
+        every call, PV.GetStatus for devices with DC PV inputs, and the
+        slow-changing WiFi, BLE, energy, system-info and error components
+        every ``EXTRAS_INTERVAL`` calls. EM.GetStatus stays in the fast group
+        because it is the only source of the CT fields. ``force_extras`` runs
+        that slow-changing group on this call regardless of the counter (the
+        readback for the controls follows from ``Sys.GetInfo``, so the caller
+        forces it after a write), and resets the counter so the next regular
+        extras cycle stays a full interval away.
 
         Raises MarstekNoResponse when the device does not answer any of the
         status requests; the caller then keeps the previous data.
@@ -1083,6 +1080,23 @@ class MarstekUDPClient:
                 mark_fresh(CMD_ES_MODE, mode_data)
                 result_data = result_data.with_es_mode_response(mode_data)
                 return
+
+        async def em_status_request() -> None:
+            nonlocal result_data, answered
+            if not self._is_method_supported(device_ip, CMD_EM_STATUS):
+                return
+            result = await self._async_query_component(
+                get_em_status(0),
+                device_ip,
+                CMD_EM_STATUS,
+                port=port,
+                timeout=timeout,
+            )
+            if result is None:
+                return
+            answered = True
+            mark_fresh(CMD_EM_STATUS, result)
+            result_data = result_data.with_em_status_response(result)
 
         async def battery_status_request() -> None:
             nonlocal result_data, answered
@@ -1164,19 +1178,6 @@ class MarstekUDPClient:
                 if result is not None:
                     answered = True
                     result_data = result_data.with_ble_status_response(result)
-            if self._is_method_supported(device_ip, CMD_EM_STATUS):
-                await spacing()
-                result = await self._async_query_component(
-                    get_em_status(0),
-                    device_ip,
-                    CMD_EM_STATUS,
-                    port=port,
-                    timeout=timeout,
-                )
-                if result is not None:
-                    answered = True
-                    mark_fresh(CMD_EM_STATUS, result)
-                    result_data = result_data.with_em_status_response(result)
             if self._is_method_supported(device_ip, CMD_ENERGY_DATA):
                 await spacing()
                 result = await self._async_query_component(
@@ -1218,6 +1219,11 @@ class MarstekUDPClient:
         await es_status_request()
         await delay(delay_ms)
         await es_mode_request()
+        await delay(delay_ms)
+        # EM.GetStatus owns the CT fields, so it belongs to the fast group:
+        # leaving it in the extras cycle would make the phase/total power and
+        # the clamp state lag by EXTRAS_INTERVAL polls.
+        await em_status_request()
         await delay(delay_ms)
         await battery_status_request()
         if include_pv and self._pv_status_supported.get(device_ip) is not False:

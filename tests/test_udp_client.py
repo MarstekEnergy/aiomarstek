@@ -166,6 +166,7 @@ async def test_get_device_status_returns_normalized_model(
                 }
             },
             {"result": {"mode": 2}},
+            {"result": {}},
             {
                 "result": {
                     "soc": 90,
@@ -216,6 +217,7 @@ async def test_get_device_status_returns_normalized_model(
     assert [request["method"] for request in requests] == [
         "ES.GetStatus",
         "ES.GetMode",
+        "EM.GetStatus",
         "Bat.GetStatus",
         "PV.GetStatus",
     ]
@@ -231,6 +233,7 @@ async def test_get_device_status_tolerates_unsupported_pv_status(
         [
             {"result": {"bat_soc": 90, "ongrid_power": -100}},
             {"result": {"mode": 0}},
+            {"result": {}},
             {"result": {"soc": 90}},
             {"error": {"code": -32601, "message": "Method not found"}},
         ]
@@ -255,6 +258,7 @@ async def test_get_device_status_tolerates_unsupported_pv_status(
     assert [(request["method"], request["params"]) for request in requests] == [
         ("ES.GetStatus", {"id": 0}),
         ("ES.GetMode", {"id": 1}),
+        ("EM.GetStatus", {"id": 0}),
         ("Bat.GetStatus", {"id": 0}),
         ("PV.GetStatus", {"id": 0}),
     ]
@@ -271,6 +275,7 @@ async def test_get_device_status_falls_back_to_es_mode_id_zero(
             {"error": {"code": -32601, "message": "Method not found"}},
             TimeoutError(),
             {"result": {"bat_soc": 75, "ongrid_power": 50, "mode": 4}},
+            {"result": {}},
             {"result": {"soc": 75}},
             {"error": {"code": -32601, "message": "Method not found"}},
         ]
@@ -299,6 +304,7 @@ async def test_get_device_status_falls_back_to_es_mode_id_zero(
         ("ES.GetStatus", {"id": 0}),
         ("ES.GetMode", {"id": 1}),
         ("ES.GetMode", {"id": 0}),
+        ("EM.GetStatus", {"id": 0}),
         ("Bat.GetStatus", {"id": 0}),
         ("PV.GetStatus", {"id": 0}),
     ]
@@ -328,10 +334,12 @@ async def test_get_device_status_skips_known_unsupported_pv_status(
     assert [request["method"] for request in requests] == [
         "ES.GetStatus",
         "ES.GetMode",
+        "EM.GetStatus",
         "Bat.GetStatus",
         "PV.GetStatus",
         "ES.GetStatus",
         "ES.GetMode",
+        "EM.GetStatus",
         "Bat.GetStatus",
     ]
 
@@ -463,6 +471,7 @@ async def test_get_device_status_raises_when_silent(
     assert client.get_last_results("192.168.1.10") == {
         "ES.GetStatus": {"bat_soc": 90, "mode": 0},
         "ES.GetMode": {"bat_soc": 90, "mode": 0},
+        "EM.GetStatus": {"bat_soc": 90, "mode": 0},
         "Bat.GetStatus": {"bat_soc": 90, "mode": 0},
     }
 
@@ -473,6 +482,7 @@ async def test_get_device_status_raises_when_silent(
     assert client.get_last_results("192.168.1.10") == {
         "ES.GetStatus": {"bat_soc": 90, "mode": 0},
         "ES.GetMode": {"bat_soc": 90, "mode": 0},
+        "EM.GetStatus": {"bat_soc": 90, "mode": 0},
         "Bat.GetStatus": {"bat_soc": 90, "mode": 0},
     }
 
@@ -497,6 +507,7 @@ async def test_get_device_status_records_partial_answers(
     assert set(client.get_last_results("192.168.1.10")) == {
         "ES.GetStatus",
         "ES.GetMode",
+        "EM.GetStatus",
         "Bat.GetStatus",
     }
 
@@ -505,6 +516,7 @@ async def test_get_device_status_records_partial_answers(
     # Only the methods that answered this poll are recorded.
     assert set(client.get_last_results("192.168.1.10")) == {
         "ES.GetMode",
+        "EM.GetStatus",
         "Bat.GetStatus",
     }
 
@@ -558,7 +570,10 @@ async def test_is_pv_status_supported_reflects_device_capability(
 async def test_get_device_status_throttles_extras(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """WiFi, BLE and EM are only queried every EXTRAS_INTERVAL polls."""
+    """WiFi and BLE are only queried every EXTRAS_INTERVAL polls.
+
+    EM.GetStatus is not throttled: it is the only source of the CT fields.
+    """
     from aiomarstek import EXTRAS_INTERVAL
 
     client = MarstekUDPClient()
@@ -586,7 +601,7 @@ async def test_get_device_status_throttles_extras(
 
     assert requests.count("Wifi.GetStatus") == 1
     assert requests.count("BLE.GetStatus") == 1
-    assert requests.count("EM.GetStatus") == 1
+    assert requests.count("EM.GetStatus") == EXTRAS_INTERVAL
     assert requests.count("Bat.GetStatus") == EXTRAS_INTERVAL
 
     await client.get_device_status("192.168.1.10", delay_ms=0)
@@ -696,10 +711,40 @@ async def test_get_device_status_merges_extras(
     assert status.ct_output_energy == 448751.0
 
 
+async def test_es_mode_ct_copy_is_not_a_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A CT field missing from EM.GetStatus stays unset, not ES.GetMode's value.
+
+    ES.GetMode repeats the CT readings but only in Auto and AI mode, so it
+    must never be used to fill a gap: the energy meter is the only source.
+    """
+    client = MarstekUDPClient()
+
+    async def fake_send_request(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        request = json.loads(args[0])
+        if request["method"] == "EM.GetStatus":
+            return {"result": {"ct_state": 1}}
+        if request["method"] == "ES.GetStatus":
+            return {"result": {"bat_soc": 90}}
+        if request["method"] == "ES.GetMode":
+            return {"result": {"mode": 0, "ct_state": 0, "total_power": 99}}
+        return {"result": {}}
+
+    monkeypatch.setattr(client, "send_request", fake_send_request)
+
+    status = await client.get_device_status(
+        "192.168.1.10", delay_ms=0, include_pv=False
+    )
+
+    assert status.ct_state is True
+    assert status.total_power is None
+
+
 async def test_get_device_status_marks_unsupported_extras(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Extras answering "method not found" are skipped afterwards."""
+    """Components answering "method not found" are skipped afterwards."""
     client = MarstekUDPClient()
     client._extras_age["192.168.1.10"] = 99  # Force the extras cycle.
     requests: list[str] = []
@@ -713,13 +758,17 @@ async def test_get_device_status_marks_unsupported_extras(
             return {"error": {"code": -32601}}
         if request["method"] == "ES.GetStatus":
             return {"result": {"bat_soc": 90}}
-        return {"result": {"mode": 0}}
+        # ES.GetMode still carries a CT copy; it must not become the value
+        # when the energy meter is the one refusing the query.
+        return {"result": {"mode": 0, "ct_state": 1, "total_power": 120}}
 
     monkeypatch.setattr(client, "send_request", fake_send_request)
 
     status = await client.get_device_status("192.168.1.10", delay_ms=0)
     assert status.wifi_rssi is None
     assert status.ble_state is None
+    assert status.ct_state is None
+    assert status.total_power is None
 
     client._extras_age["192.168.1.10"] = 99  # Due again on the next poll.
     await client.get_device_status("192.168.1.10", delay_ms=0)
@@ -1040,8 +1089,9 @@ async def test_extras_queries_are_spaced(
     )
 
     # One delay between each pair of queries: es_status->es_mode,
-    # es_mode->battery, battery->extras, then the five gaps between the six
-    # extras queries (WiFi, BLE, EM, energy, system info, errors).
+    # es_mode->em_status, em_status->battery, battery->extras, then the four
+    # gaps between the five extras queries (WiFi, BLE, energy, system info,
+    # errors).
     assert sleeps.count(2.0) == 8
     # The new components are parsed into the same status snapshot.
     assert status.dod == 40

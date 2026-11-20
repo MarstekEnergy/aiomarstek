@@ -51,29 +51,40 @@ def test_es_status_derives_battery_power_without_bat_power() -> None:
     assert status.battery_power == 100
 
 
-def test_es_mode_parses_ct_fields() -> None:
-    """ES.GetMode CT fields are normalized and energies scaled to Wh."""
-    status = MarstekDeviceStatus(device_ip="192.168.1.10").with_es_mode_response(
+def test_es_mode_ignores_ct_fields() -> None:
+    """ES.GetMode repeats the CT fields, but EM.GetStatus is the only source.
+
+    The device documents the ES.GetMode copies as valid in Auto and AI mode
+    only, so the parser leaves the CT fields exactly as the last EM reading
+    left them.
+    """
+    status = MarstekDeviceStatus(
+        device_ip="192.168.1.10", ct_state=True, total_power=123
+    ).with_es_mode_response(
         {
             "mode": "Auto",
             "ongrid_power": 100,
             "offgrid_power": 0,
             "bat_soc": 98,
             "ct_state": 0,
-            "a_power": 0,
-            "b_power": 0,
-            "c_power": 0,
-            "total_power": 0,
+            "a_power": 1,
+            "b_power": 2,
+            "c_power": 3,
+            "total_power": 6,
             "input_energy": 3086320,
             "output_energy": 4487510,
         }
     )
 
     assert status.device_mode == "auto"
-    assert status.ct_state is False
-    assert status.total_power == 0
-    assert status.ct_input_energy == 308632.0
-    assert status.ct_output_energy == 448751.0
+    assert status.battery_soc == 98
+    assert status.ct_state is True
+    assert status.a_power is None
+    assert status.b_power is None
+    assert status.c_power is None
+    assert status.total_power == 123
+    assert status.ct_input_energy is None
+    assert status.ct_output_energy is None
 
 
 def test_battery_status_parses_response() -> None:

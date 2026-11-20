@@ -99,7 +99,7 @@ FIELD_UNITS: Final[dict[str, FieldUnit]] = {
     "total_grid_output_energy": FieldUnit("total_grid_output_energy", 1, "Wh", "Wh"),
     "total_grid_input_energy": FieldUnit("total_grid_input_energy", 1, "Wh", "Wh"),
     "total_load_energy": FieldUnit("total_load_energy", 1, "Wh", "Wh"),
-    # ES.GetMode / EM.GetStatus (same CT fields from either source)
+    # EM.GetStatus CT counters (ES.GetMode repeats them, but only in Auto/AI)
     "ct_input_energy": FieldUnit("input_energy", 0.1, "0.1 Wh", "Wh"),
     "ct_output_energy": FieldUnit("output_energy", 0.1, "0.1 Wh", "Wh"),
     # Bat.GetStatus: battery-side lifetime totals
@@ -314,7 +314,9 @@ class MarstekDeviceStatus:
     pv_power: MarstekStatusNumber | None = None
     ongrid_power: MarstekStatusNumber | None = None
     offgrid_power: MarstekStatusNumber | None = None
-    # ES.GetMode / EM.GetStatus CT fields
+    # EM.GetStatus CT fields. ES.GetMode repeats the same values, but only
+    # documents them as valid in Auto and AI mode, so EM.GetStatus is the
+    # single source of truth (see with_es_mode_response).
     ct_state: bool | None = None
     a_power: MarstekStatusNumber | None = None
     b_power: MarstekStatusNumber | None = None
@@ -375,22 +377,20 @@ class MarstekDeviceStatus:
     def with_es_mode_response(
         self, response: Mapping[str, object]
     ) -> MarstekDeviceStatus:
-        """Return status updated with an ES.GetMode response."""
+        """Return status updated with an ES.GetMode response.
+
+        ES.GetMode repeats the CT clamp readings (``ct_state``, phase/total
+        power and input/output energy), but the Open API documents those
+        fields as valid in Auto and AI mode only, and the same values arrive
+        from EM.GetStatus in every mode. The energy meter is therefore the
+        single source of truth for the CT fields: this method deliberately
+        ignores them, so an inapplicable or stale ES.GetMode copy can never
+        overwrite an EM reading.
+        """
         battery_soc = _response_number(response, "bat_soc", self.battery_soc)
         ongrid_power = _response_number(response, "ongrid_power", self.ongrid_power)
         offgrid_power = _response_number(response, "offgrid_power", self.offgrid_power)
         device_mode = _response_mode(response, "mode", self.device_mode)
-        ct_state = _response_ct_state(response, "ct_state", self.ct_state)
-        a_power = _response_number(response, "a_power", self.a_power)
-        b_power = _response_number(response, "b_power", self.b_power)
-        c_power = _response_number(response, "c_power", self.c_power)
-        total_power = _response_number(response, "total_power", self.total_power)
-        ct_input_energy = _response_field_number(
-            response, "ct_input_energy", self.ct_input_energy
-        )
-        ct_output_energy = _response_field_number(
-            response, "ct_output_energy", self.ct_output_energy
-        )
 
         battery_status = self.battery_status
         if "ongrid_power" in response:
@@ -415,13 +415,6 @@ class MarstekDeviceStatus:
             battery_status=battery_status,
             ongrid_power=ongrid_power,
             offgrid_power=offgrid_power,
-            ct_state=ct_state,
-            a_power=a_power,
-            b_power=b_power,
-            c_power=c_power,
-            total_power=total_power,
-            ct_input_energy=ct_input_energy,
-            ct_output_energy=ct_output_energy,
         )
 
     def with_es_status_response(
@@ -678,9 +671,10 @@ class MarstekDeviceStatus:
     ) -> MarstekDeviceStatus:
         """Return status updated with an EM.GetStatus response.
 
-        The energy meter reports the same CT fields that ES.GetMode returns
-        in Auto and AI mode; values from either source update the same
-        normalized fields.
+        The energy meter is the only source of the CT fields. ES.GetMode
+        repeats them, but only in Auto and AI mode, so its copy is ignored
+        (see :meth:`with_es_mode_response`) and a missing EM field simply
+        keeps the previous EM reading.
         """
         ct_state = _response_ct_state(response, "ct_state", self.ct_state)
         a_power = _response_number(response, "a_power", self.a_power)
