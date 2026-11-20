@@ -914,9 +914,12 @@ def _response_mode(
         normalized = value.casefold()
         if normalized in _DEVICE_MODE_MAP.values():
             return normalized
-    elif isinstance(value, int) and not isinstance(value, bool):
-        if normalized := _DEVICE_MODE_MAP.get(value):
-            return normalized
+    elif (
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and (normalized := _DEVICE_MODE_MAP.get(value))
+    ):
+        return normalized
     raise TypeError(f"{key} must be a supported operating mode or null")
 
 
